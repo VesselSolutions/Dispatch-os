@@ -24,6 +24,7 @@ body{background:var(--bg);color:var(--tx);font-family:Segoe UI,system-ui,sans-se
 .sb-role{display:inline-block;padding:1px 7px;border-radius:3px;font-size:9px;font-weight:700;margin-top:4px;text-transform:uppercase;letter-spacing:.5px}
 .r-admin{background:rgba(168,85,247,.15);color:var(--pur)}
 .r-disp{background:rgba(61,127,255,.15);color:var(--blue)}
+.r-sdr{background:rgba(245,158,11,.15);color:var(--amb)}
 .nav{flex:1;overflow-y:auto;padding:8px 0}
 .nsec{font-size:9px;color:var(--mu);font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:10px 16px 3px}
 .ni{display:flex;align-items:center;gap:9px;padding:8px 16px;font-size:12px;color:var(--mu);cursor:pointer;border-left:3px solid transparent;transition:all .12s;position:relative;user-select:none;-webkit-tap-highlight-color:transparent}
@@ -125,10 +126,48 @@ const {useState,useEffect,useCallback,useRef}=React;
 const SB="https://wearfwfkzvpvjtsmyfof.supabase.co";
 const SK="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndlYXJmd2ZrenZwdmp0c215Zm9mIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3Njc5MDUsImV4cCI6MjA5MzM0MzkwNX0.lSGekfgAYwqhs-ijfvEH37rgNOneLtc5VM2mcfZylAc";
 const SBH={"apikey":SK,"Authorization":"Bearer "+SK,"Content-Type":"application/json"};
+// ── Supabase Auth: every data request carries the logged-in user's token.
+// The database (RLS) decides what each role may read — the browser never gets data it isn't allowed.
+let _auth=null;try{_auth=JSON.parse(sessionStorage.getItem("vs_auth")||"null");}catch{}
+if(_auth)SBH.Authorization="Bearer "+_auth.access_token;
+function setAuth(a){
+  _auth=a;
+  if(a){sessionStorage.setItem("vs_auth",JSON.stringify(a));SBH.Authorization="Bearer "+a.access_token;}
+  else{sessionStorage.removeItem("vs_auth");SBH.Authorization="Bearer "+SK;}
+}
+async function authToken(grant,body){
+  const r=await fetch(SB+"/auth/v1/token?grant_type="+grant,{method:"POST",headers:{apikey:SK,"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(d.error_description||d.msg||"Invalid email or password");
+  return{access_token:d.access_token,refresh_token:d.refresh_token,expires_at:Date.now()+d.expires_in*1000,email:(d.user?.email||"").toLowerCase()};
+}
+async function refreshAuth(){
+  if(!_auth)return;
+  try{setAuth(await authToken("refresh_token",{refresh_token:_auth.refresh_token}));}
+  catch(e){console.warn("Session expired:",e.message);setAuth(null);}
+}
+setInterval(()=>{if(_auth&&_auth.expires_at-Date.now()<5*60*1000)refreshAuth();},60000);
+// Admin-only helpers (the database rejects them for anyone else)
+async function sbSignup(email,password){
+  const r=await fetch(SB+"/auth/v1/signup",{method:"POST",headers:{apikey:SK,"Content-Type":"application/json"},body:JSON.stringify({email,password})});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(d.msg||d.error_description||d.message||"Could not create login");
+}
+async function sbUpsertAccess(row){
+  const r=await fetch(SB+"/rest/v1/app_access",{method:"POST",headers:{...SBH,"Prefer":"resolution=merge-duplicates"},body:JSON.stringify(row)});
+  if(!r.ok)throw new Error("Access update failed: "+await r.text());
+}
+async function sbDeleteAccess(email){
+  const r=await fetch(SB+"/rest/v1/app_access?email=eq."+encodeURIComponent(email),{method:"DELETE",headers:SBH});
+  if(!r.ok)throw new Error("Could not revoke access: "+await r.text());
+}
+function genPassword(){const a=new Uint8Array(9);crypto.getRandomValues(a);return Array.from(a,b=>"abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"[b%56]).join("")+"!7";}
+// Login is by USERNAME. Supabase needs an email-style ID, so it is built from the username
+// (e.g. "vinny" -> vinny@vesselsolutions.io). The contact email on the profile is separate.
+const loginEmail=u=>(u.u?u.u+"@vesselsolutions.io":"").trim().toLowerCase();
 function dbGet(k){return fetch(SB+"/rest/v1/kv_store?key=eq."+k+"&select=value",{headers:SBH}).then(r=>r.json()).then(d=>d&&d[0]?d[0].value:undefined).catch(()=>undefined);}
 function dbSet(k,v){
   // SAFETY GUARD: never write empty/tiny arrays for critical keys
-  // This prevents a second device opening the app before data loads from wiping Supabase
   const CRITICAL_MIN={"vs4_d":1,"vs4_c":1,"vs4_l":1,"vs4_u":1};
   if(CRITICAL_MIN[k]!==undefined&&Array.isArray(v)&&v.length<CRITICAL_MIN[k]){
     const e2=document.getElementById("sync-dot");
@@ -136,6 +175,27 @@ function dbSet(k,v){
     console.warn("[GUARD] Blocked empty write to",k,"— array length",v.length);
     return;
   }
+  // ANTI-OVERWRITE GUARD for loads: if server has more loads than we do, merge instead of replace
+  if(k==="vs4_l"&&Array.isArray(v)){
+    dbGet(k).then(serverVal=>{
+      const serverArr=Array.isArray(serverVal)?serverVal:[];
+      if(serverArr.length>v.length){
+        // Server has more loads — merge: keep all server loads, update ones we have changes for
+        const localMap=new Map(v.map(l=>[l.id,l]));
+        const merged=serverArr.map(sl=>localMap.has(sl.id)?localMap.get(sl.id):sl);
+        // Add any local loads not on server
+        v.forEach(l=>{if(!serverArr.find(sl=>sl.id===l.id))merged.push(l);});
+        console.warn("[GUARD] Merged loads — server had",serverArr.length,"local had",v.length,"merged:",merged.length);
+        _dbSetRaw(k,merged);
+      } else {
+        _dbSetRaw(k,v);
+      }
+    }).catch(()=>_dbSetRaw(k,v));
+    return;
+  }
+  _dbSetRaw(k,v);
+}
+function _dbSetRaw(k,v){
   const e=document.getElementById("sync-dot");
   if(e){e.textContent="● saving";e.style.color="#f59e0b";}
   let payload=v;
@@ -169,7 +229,7 @@ async function uploadDoc(dataUrl,path){
     }
     const blob=new Blob(chunks,{type:mime});
     const res=await fetch(SB+"/storage/v1/object/documents/"+path+ext,{
-      method:"POST",headers:{"apikey":SK,"Authorization":"Bearer "+SK,"Content-Type":mime,"x-upsert":"true"},body:blob
+      method:"POST",headers:{"apikey":SK,"Authorization":SBH.Authorization,"Content-Type":mime,"x-upsert":"true"},body:blob
     });
     if(!res.ok){const t=await res.text();throw new Error(res.status+": "+t);}
     return SB+"/storage/v1/object/public/documents/"+path+ext;
@@ -361,47 +421,22 @@ const getPodList=(l)=>{
   return loadPods(l.id);
 };
 
-const I_USERS=[
-  {id:1,u:"info",pw:"vessel2026",name:"Mohamed El-feki",role:"admin",email:"Info@vesselsolutions.io",pct:0,permDrv:[],tempDrv:[]},
-  {id:2,u:"jr",pw:"jr2026",name:"JR",role:"dispatcher",email:"JR@vesselsolutions.io",pct:0,permDrv:["HAYDAR","AMMAR","KARAR","NOOR"],tempDrv:[]},
-  {id:3,u:"dispatch",pw:"dispatch2026",name:"DISPATCH",role:"admin",email:"Dispatch@vesselsolutions.io",pct:3,permDrv:[],tempDrv:[]},
-  {id:4,u:"vinny",pw:"vinny2026",name:"VINNY",role:"dispatcher",email:"vinny@vesselsolutions.io",pct:3,permDrv:["ABBAS","FADEL","ALI"],tempDrv:[]},
-  {id:5,u:"dennis",pw:"dennis2026",name:"DENNIS",role:"dispatcher",email:"dennis@vesselsolutions.io",pct:3,permDrv:[],tempDrv:[]},
-  {id:6,u:"cherry",pw:"cherry2026",name:"CHERRY",role:"dispatcher",email:"cherry@vesselsolutions.io",pct:3,permDrv:[],tempDrv:[]},
-  {id:7,u:"salah",pw:"salah2026",name:"SALAH",role:"dispatcher",email:"salah@vesselsolutions.io",pct:3,permDrv:[],tempDrv:[]},
-  {id:8,u:"bizoo",pw:"bizoo2026",name:"BIZOO",role:"dispatcher",email:"bizoo@vesselsolutions.io",pct:3,permDrv:[],tempDrv:[]},
-];
-const I_CARR=[
-  {id:1,name:"HMK LOGISTICS LLC",mc:"1506981",dot:"4006045",owner:"Mohamed El-feki",phone:"(773) 750-3971",email:"HMKLOGIST@GMAIL.COM",address:"2494 OAKTON ST, EVANSTON IL 60202",rts:"Cashapp@rtsfinancial.com",truckstop:"Mhmk123@",notes:"No Tanker end. No 125 cargo insurance.",bl:["TQL","MOLO","Ryder","Destination Transport LLC","Circle Logistics Inc","Global Tranz/afn","Landstar","RPM","KMX Logistics"]},
-  {id:2,name:"NEW FUTURE LOGISTICS LLC",mc:"1318160",dot:"3732554",owner:"Hassan Almafra",phone:"540-746-6043",email:"newfutureloads@yahoo.com",address:"3355 S MAIN ST, HARRISONBURG VA 22001",rts:"dal.Hassan@1985aaaaa",truckstop:"Hassan@1985",notes:"Whole port. p 4:30am. Monday 2pm. No roll ups swing doors.",bl:["Reliable Transportation Solutions LLC","PLS Logistics Services"]},
-  {id:3,name:"BANEEN GROUP LLC",mc:"1499643",dot:"3940945",owner:"Safa Alshakarh",phone:"956-987-7253",email:"BANEENGROUPLLC@GMAIL.COM",address:"8051 WILLOW COUNTRY, SAN ANTONIO TX 78254",rts:"",truckstop:"Baneenbee123@",notes:"",bl:[]},
-];
-const I_DRV=[
-  {id:1,name:"HAYDAR",carrier:"HMK LOGISTICS LLC",phone:"(872) 235-1947",truck:"22 U4706",trailer:"Dry Van",vin:"",cdl:"",notes:""},
-  {id:2,name:"AMMAR",carrier:"HMK LOGISTICS LLC",phone:"224-260-1762",truck:"22 1132",trailer:"Dry Van",vin:"",cdl:"",notes:""},
-  {id:3,name:"KARAR",carrier:"HMK LOGISTICS LLC",phone:"872 203 3344",truck:"21 7766",trailer:"Dry Van",vin:"",cdl:"",notes:""},
-  {id:4,name:"NOOR",carrier:"HMK LOGISTICS LLC",phone:"773 642 9855",truck:"19 u1725",trailer:"Dry Van",vin:"",cdl:"",notes:""},
-  {id:5,name:"FADEL",carrier:"NEW FUTURE LOGISTICS LLC",phone:"715 848 0831",truck:"2028",trailer:"",vin:"",cdl:"",notes:""},
-  {id:6,name:"ALI",carrier:"NEW FUTURE LOGISTICS LLC",phone:"718 903 6505",truck:"",trailer:"",vin:"",cdl:"",notes:""},
-  {id:7,name:"ABBAS",carrier:"NEW FUTURE LOGISTICS LLC",phone:"682 216 8573",truck:"2022",trailer:"288MFC",vin:"",cdl:"",notes:""},
-  {id:8,name:"SAMER ABO ALI",carrier:"NEW FUTURE LOGISTICS LLC",phone:"815 323 2273",truck:"",trailer:"531975",vin:"",cdl:"",notes:""},
-  {id:9,name:"OMAR",carrier:"BANEEN GROUP LLC",phone:"540 214 9270",truck:"724",trailer:"",vin:"",cdl:"",notes:""},
-  {id:10,name:"ROBERT",carrier:"BANEEN GROUP LLC",phone:"704 966 1562",truck:"70",trailer:"",vin:"",cdl:"",notes:""},
-  {id:11,name:"TODD BENALLY",carrier:"BANEEN GROUP LLC",phone:"(602) 831 6061",truck:"",trailer:"",vin:"",cdl:"",notes:""},
-  {id:12,name:"BASSAM",carrier:"BANEEN GROUP LLC",phone:"619 328 8915",truck:"",trailer:"",vin:"",cdl:"",notes:"30klbs"},
-  {id:13,name:"ALVIN",carrier:"BANEEN GROUP LLC",phone:"(732) 912-4761",truck:"",trailer:"",vin:"",cdl:"",notes:""},
-  {id:14,name:"MICHAEL",carrier:"BANEEN GROUP LLC",phone:"(732) 912-4761",truck:"1988",trailer:"",vin:"",cdl:"",notes:""},
-  {id:15,name:"ADAM",carrier:"BANEEN GROUP LLC",phone:"(508) 604-0152",truck:"22",trailer:"",vin:"",cdl:"",notes:""},
-  {id:16,name:"TOD",carrier:"BANEEN GROUP LLC",phone:"",truck:"",trailer:"",vin:"",cdl:"",notes:""},
-  {id:17,name:"SAYF BABEEN G",carrier:"BANEEN GROUP LLC",phone:"(210) 851-6979",truck:"",trailer:"",vin:"",cdl:"",notes:""},
-  {id:18,name:"ABDULLAH KAMA",carrier:"BANEEN GROUP LLC",phone:"(623) 306-8088",truck:"",trailer:"",vin:"",cdl:"",notes:""},
-];
+// No seed data in the page: users, carriers and drivers load from the database after login
+const I_USERS=[];
+const I_CARR=[];
+const I_DRV=[];
 const I_LOADS=[];
+// SDR (external Sales Development Rep) — commission on referred trucks
+// Carrier dispatch fee % → SDR rate % of the truck's eligible gross revenue
+const SDR_TIERS={4:0.5,5:1,6:1.5};
+const SDR_MONTHS=12;// commission window per truck, from its first completed load
+// Eligible = completed (delivered) and not cancelled
+const sdrEligible=l=>!l.cancelled&&l.status!=="Cancelled"&&getAutoStatus(l)==="Delivered";
 
 // LOGIN
 function Login({onLogin}){
-  const[u,su]=useState("");const[p,sp]=useState("");const[err,se]=useState("");
-  const go=e=>{e.preventDefault();if(!onLogin(u.trim().toLowerCase(),p))se("Invalid username or password");};
+  const[u,su]=useState("");const[p,sp]=useState("");const[err,se]=useState("");const[busy,sb]=useState(false);
+  const go=async e=>{e.preventDefault();se("");sb(true);try{await onLogin(u.trim().toLowerCase(),p);}catch(x){se(x.message);}sb(false);};
   return(
     <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"var(--bg)"}}>
       <div className="card" style={{width:320,padding:28}}>
@@ -413,7 +448,7 @@ function Login({onLogin}){
           <div className="fl" style={{marginBottom:12}}><label>Username</label><input value={u} onChange={e=>su(e.target.value)} autoComplete="username" autoFocus/></div>
           <div className="fl" style={{marginBottom:16}}><label>Password</label><input type="password" value={p} onChange={e=>sp(e.target.value)} autoComplete="current-password"/></div>
           {err&&<div className="al ald" style={{marginBottom:12}}>{err}</div>}
-          <button type="submit" className="btn btn-p" style={{width:"100%",justifyContent:"center",padding:"10px"}}>Sign In</button>
+          <button type="submit" disabled={busy} className="btn btn-p" style={{width:"100%",justifyContent:"center",padding:"10px"}}>{busy?"Signing in…":"Sign In"}</button>
         </form>
       </div>
     </div>
@@ -436,7 +471,36 @@ function getAutoStatus(load){
   return load.status||"In Transit";
 }
 
+// Auth gate: nothing is loaded from the database until a user is logged in
 function App(){
+  const[sess,setSess]=useState(()=>{try{const s=sessionStorage.getItem("vs_s");return s&&_auth?JSON.parse(s):null}catch{return null}});
+  const[ready,setReady]=useState(()=>!_auth||_auth.expires_at-Date.now()>60000);
+  React.useEffect(()=>{if(!ready)refreshAuth().then(()=>{if(!_auth)setSess(null);setReady(true);});},[]);
+  const login=async(id,pw)=>{
+    const email=id.includes("@")?id:id+"@vesselsolutions.io";
+    const a=await authToken("password",{email,password:pw});
+    setAuth(a);
+    const acc=await fetch(SB+"/rest/v1/app_access?select=*&email=eq."+encodeURIComponent(a.email),{headers:SBH}).then(r=>r.json()).catch(()=>null);
+    if(acc&&acc.code==="PGRST205"){setAuth(null);throw new Error("Security setup not finished: run vessel-security-1-setup.sql in Supabase.");}
+    const row=Array.isArray(acc)&&acc[0];
+    if(!row){setAuth(null);throw new Error("This account has no access. Contact Vessel Solutions.");}
+    let s={email:a.email,role:row.role,name:row.name||a.email};
+    if(row.role!=="sdr"){
+      const us=await dbGet("vs4_u");
+      const f=Array.isArray(us)&&us.find(x=>loginEmail(x)===a.email);
+      if(f){const{pw,...rest}=f;s={...rest,email:a.email,role:row.role};}
+    }
+    setSess(s);sessionStorage.setItem("vs_s",JSON.stringify(s));
+  };
+  const logout=()=>{setSess(null);sessionStorage.removeItem("vs_s");setAuth(null);};
+  if(!ready)return<div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",color:"var(--mu)"}}>Loading…</div>;
+  if(!sess||!_auth)return<Login onLogin={login}/>;
+  // SDR: external user — gets only their own trucks from the server, never the full database
+  if(sess.role==="sdr")return<SDRPortal onLogout={logout}/>;
+  return<MainApp sess={sess} setSess={setSess} logout={logout}/>;
+}
+
+function MainApp({sess,setSess,logout}){
   // Clear old data on first run of this version
   React.useEffect(()=>{
     if(!localStorage.getItem("vs4_v2")){
@@ -460,7 +524,6 @@ function App(){
       }
     }catch{}
   },[]);
-  const[sess,setSess]=useState(()=>{try{const s=sessionStorage.getItem("vs_s");return s?JSON.parse(s):null}catch{return null}});
   const[users,setUsers]=useLS("vs4_u",I_USERS);
   const[loads,setLoads]=useLS("vs4_l",I_LOADS);
   const[carriers,setCar]=useLS("vs4_c",I_CARR);
@@ -476,16 +539,16 @@ function App(){
   },[users.length]);
   const[tab,setTab]=useState("dash");
   const[sbOpen,setSb]=useState(false);
-  const EMBEDDED_KEY="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";
-  const[apiKey,setApiKeyState]=useState(()=>{const stored=localStorage.getItem("vs_ak");if(stored&&stored.startsWith("sk-ant-api03-")&&stored!==EMBEDDED_KEY){return stored;}localStorage.setItem("vs_ak",EMBEDDED_KEY);return EMBEDDED_KEY;});
+  // Claude API key lives in the database (staff-only via RLS) — never in the page source. Admin sets it in the sidebar.
+  const[apiKey,saveApiKey]=useLS("vs4_ak","");
+  React.useEffect(()=>{try{localStorage.removeItem("vs_ak");}catch{}},[]);// drop the old leaked key from this browser
   const[showKey,setShowKey]=useState(false);
-  const saveApiKey=(k)=>{setApiKeyState(k);localStorage.setItem("vs_ak",k);};
-  const login=(u,p)=>{const f=users.find(x=>x.u===u&&x.pw===p);if(!f)return false;setSess(f);sessionStorage.setItem("vs_s",JSON.stringify(f));return true};
   React.useEffect(()=>{if(!sess)return;const f=users.find(u=>u.id===sess.id);if(f&&f.pct!==sess.pct)setSess(s=>({...s,pct:(s.id===1||s.id===2)?0:f.pct}));},[users]);
-  const logout=()=>{setSess(null);sessionStorage.removeItem("vs_s")};
-  if(!sess)return<Login onLogin={login}/>;
   const sessPct=(sess.id===1||sess.id===2)?0:((sess.pct??3));
-  const isAdmin=sess.role==="admin";
+  const isAdmin=sess.role==="admin";// role comes from the server (app_access), not from the editable users list
+  // Admin alert: interested leads waiting for a closer (red badge on "Leads")
+  const[leadAlert,setLeadAlert]=useState(0);
+  React.useEffect(()=>{const q=isAdmin?"leads?select=id&stage=eq.interested":"leads?select=id&stage=eq.transferred&closer_email=eq."+encodeURIComponent(_auth?.email||"");const go=()=>sbApi(q).then(d=>setLeadAlert((d||[]).length)).catch(()=>{});go();const iv=setInterval(go,30000);return()=>clearInterval(iv);},[isAdmin]);
   const myLoads=isAdmin?loads:loads.filter(l=>l.dispatcher?.toUpperCase()===sess.name?.toUpperCase());
   const podAlert=loads.filter(l=>hasPod(l)&&l.factoring!=="YES").length;
   const unfact=myLoads.filter(l=>l.factoring==="NO"&&l.status==="Delivered").length;
@@ -495,6 +558,7 @@ function App(){
     {s:"Operations"},{id:"dash",l:"Dashboard",i:"📊"},{id:"loads",l:"Load Board",i:"🚛"},{id:"add",l:"Add Load",i:"➕"},{id:"import",l:"Import CSV",i:"📂"},
     ...(isAdmin?[{s:"Finance"},{id:"fact",l:"Factoring",i:"💰",badge:podAlert},{id:"aifact",l:"AI Factoring",i:"🤖"},{id:"inv",l:"Invoices",i:"🧾"}]:[]),
     {s:"Dispatch"},{id:"ops",l:"Daily Ops Plan",i:"📋"},{id:"drv",l:"Drivers",i:"👤"},
+    {s:"Sales"},{id:"leads",l:"Leads",i:"🎯",badge:leadAlert},{id:"board",l:"SDR Leaderboard",i:"🏆"},...(isAdmin?[{id:"sdrperf",l:"SDR Performance",i:"📈"}]:[]),
     ...(isAdmin?[{s:"Admin"},{id:"usr",l:"Users",i:"👥"},{id:"carr",l:"Carriers",i:"🏢"},{id:"bl",l:"Blacklist",i:"🚫"},{id:"calc",l:"Rate Calc",i:"🧮"},{id:"perf",l:"Performance",i:"📈"},{id:"reports",l:"Reports",i:"📋"}]:[{s:"Tools"},{id:"carr",l:"Carriers",i:"🏢"},{id:"bl",l:"Blacklist",i:"🚫"},{id:"calc",l:"Rate Calc",i:"🧮"}]),
     {id:"chat",l:"Team Chat",i:"💬",badge:unread},
   ];
@@ -520,7 +584,7 @@ function App(){
         </div>
         <nav className="nav">{nav.map((p,i)=>p.s?<div key={i} className="nsec">{p.s}</div>:<div key={p.id} className={"ni"+(tab===p.id?" on":"")} onClick={()=>{setTab(p.id);setSb(false)}}><span>{p.i}</span>{p.l}{p.badge>0&&<span className="nbadge">{p.badge}</span>}</div>)}</nav>
         <div className="sb-foot">
-          <div style={{marginBottom:10}}>
+          {isAdmin&&<div style={{marginBottom:10}}>
             <div style={{fontSize:9,fontWeight:700,color:"var(--mu)",textTransform:"uppercase",letterSpacing:".5px",marginBottom:4,display:"flex",alignItems:"center",gap:5}}>
               🔑 Claude API Key
               {apiKey&&<span style={{color:"var(--green)",fontSize:9}}>● set</span>}
@@ -538,7 +602,7 @@ function App(){
               </button>
             </div>
             {!apiKey&&<div style={{fontSize:9,color:"var(--red)",marginTop:3}}>Required for AI Rate Con & Factoring</div>}
-          </div>
+          </div>}
           <button className="lo-btn" onClick={logout}>Sign Out</button>
         </div>
       </div>
@@ -558,6 +622,9 @@ function App(){
         {isAdmin&&tab==="perf" &&<Performance ctx={ctx}/>}
         {isAdmin&&tab==="reports"&&<Reports ctx={ctx}/>}
         {tab==="chat"  &&<Chat ctx={ctx}/>}
+        {tab==="leads" &&<Leads isAdmin={isAdmin} myEmail={_auth?.email}/>}
+        {tab==="board" &&<Leaderboard myName={sess.name}/>}
+        {isAdmin&&tab==="sdrperf"&&<SDRPerformance users={users} loads={loads} drivers={drivers}/>}
         {tab==="bl"     &&<Blacklist ctx={ctx}/>}
       </div>
     </div>
@@ -1082,7 +1149,7 @@ function ExModal({load,onClose,onSave,isAdmin}){
             </div>
             <Section title="Financials"/>
             <div className="fg">
-              <div className="fl"><label>Amount ($)</label><input type="number" value={f.amount} onChange={e=>u("amount",parseFloat(e.target.value)||0)}/></div>
+              <div className="fl"><label>Amount ($)</label><input type="number" value={f.amount} onChange={e=>u("amount",Math.round(parseFloat(e.target.value)||0))}/></div>
               <div className="fl"><label>Miles</label><input type="number" value={f.miles} onChange={e=>u("miles",parseFloat(e.target.value)||"")}/></div>
               <div className="fl"><label>Deadhead (mi)</label><input type="number" value={f.dh} onChange={e=>u("dh",parseFloat(e.target.value)||"")}/></div>
               <div className="fl"><label>Status</label><select value={f.status} onChange={e=>u("status",e.target.value)}>{sts.map(s=><option key={s}>{s}</option>)}</select></div>
@@ -1104,7 +1171,7 @@ function ExModal({load,onClose,onSave,isAdmin}){
             <div className="fg">
               <div className="fl"><label>Status</label><select value={f.status} onChange={e=>u("status",e.target.value)}>{sts.map(s=><option key={s}>{s}</option>)}</select></div>
               <div className="fl"><label>Factoring</label><select value={f.factoring} onChange={e=>u("factoring",e.target.value)}><option>YES</option><option>NO</option></select></div>
-              <div className="fl"><label>Amount ($)</label><input type="number" value={f.amount} onChange={e=>u("amount",parseFloat(e.target.value)||0)}/></div>
+              <div className="fl"><label>Amount ($)</label><input type="number" value={f.amount} onChange={e=>u("amount",Math.round(parseFloat(e.target.value)||0))}/></div>
               <div className="fl"><label>Miles</label><input type="number" value={f.miles} onChange={e=>u("miles",parseFloat(e.target.value)||"")}/></div>
               <div className="fl"><label>Pickup Date</label><input type="date" value={f.pu} onChange={e=>u("pu",e.target.value)}/></div>
               <div className="fl"><label>Delivery Date</label><input type="date" value={f.dlv} onChange={e=>u("dlv",e.target.value)}/></div>
@@ -2601,26 +2668,95 @@ function Drivers({ctx}){
 // USERS
 function Users({ctx}){
   const{users,setUsers,loads,setLoads,sess,drivers}=ctx;
-  const[modal,sm]=useState(false);const[editU,seu]=useState(null);const[f,sf]=useState({u:"",pw:"",name:"",email:"",role:"dispatcher",pct:3,permDrv:[],tempDrv:[]});const[spw,ssw]=useState({});
+  const[modal,sm]=useState(false);const[editU,seu]=useState(null);const[f,sf]=useState({u:"",pw:"",name:"",email:"",role:"dispatcher",pct:3,permDrv:[],tempDrv:[]});
+  const[busy,setBusy]=useState(false);
+  // Closers: who can receive leads to close (admin-managed list in the database)
+  const[closerSet,setCloserSet]=useState(new Set());
+  const loadClosers=()=>sbApi("lead_closers?select=email").then(d=>setCloserSet(new Set((d||[]).map(x=>x.email)))).catch(()=>{});
+  // Server-side access list (who can actually log in, and as what)
+  const[access,setAccess]=useState({});
+  const loadAccess=()=>fetch(SB+"/rest/v1/app_access?select=*",{headers:SBH}).then(r=>r.json()).then(d=>{if(Array.isArray(d))setAccess(Object.fromEntries(d.map(r=>[r.email,r])));}).catch(()=>{});
+  React.useEffect(()=>{loadAccess();loadClosers();},[]);
   const allDrvs=[...new Set(drivers.map(d=>d.name))];
-  const open=(u)=>{sf(u?{...u}:{u:"",pw:"",name:"",email:"",role:"dispatcher",pct:3,permDrv:[],tempDrv:[]});seu(u||null);sm(true)};
-  const save=()=>{
-    if(!f.u||!f.name||!f.pw){alert("Username, name, password required.");return;}
+  const open=(u)=>{sf(u?{...u,pw:"",_closer:closerSet.has(loginEmail(u))}:{u:"",pw:genPassword(),name:"",email:"",role:"dispatcher",pct:3,permDrv:[],tempDrv:[]});seu(u||null);sm(true)};
+  const accessRow=u=>({email:loginEmail(u),role:u.role,name:u.name,sdr_trucks:u.role==="sdr"?(u.sdrTrucks||[]):[]});
+  // Create the Supabase login + grant access. Password is never stored in the app.
+  const createLogin=async(u,pw)=>{
+    const email=loginEmail(u);
+    try{await sbSignup(email,pw);}
+    catch(e){
+      if(!/already|registered|exists/i.test(e.message))throw e;
+      // An account with this email exists. Only grant access if YOU created it (e.g. in the Supabase dashboard).
+      if(!window.confirm("A login already exists for username \""+(u.u||email)+"\".\n\nOnly continue if you created it yourself (Supabase dashboard). Otherwise someone else may have registered it.\n\nGrant access to it?"))throw new Error("Cancelled");
+      pw=null;
+    }
+    await sbUpsertAccess(accessRow(u));
+    return pw;
+  };
+  // Create the Supabase login using the person's CURRENT password (nothing changes for them).
+  // The old password copy stays in the users list until the final lockdown, so the old website keeps working meanwhile.
+  const activate=async(u)=>{
+    if(!loginEmail(u)){alert("This user has no username.");return;}
+    let pw=u.pw;
+    if(pw){if(!window.confirm("Create login for "+u.name+" with their CURRENT username and password?\n\nUsername: "+u.u+"\n(password stays the same)"))return;}
+    else{pw=window.prompt("No password on file for "+u.name+". Set a password (min 6 characters) and give it to them privately:",genPassword());if(!pw)return;}
+    if(pw.length<6){alert("Password must be at least 6 characters.");return;}
+    setBusy(true);
+    try{const used=await createLogin(u,pw);await loadAccess();alert(used?(u.pw?"Login active for "+u.name+". Same username and password as before.":"Login active.\n\nUsername: "+u.u+"\nPassword: "+used):"Access granted to existing login "+u.u+".");}
+    catch(e){if(e.message!=="Cancelled")alert(e.message);}
+    setBusy(false);
+  };
+  // One click: create logins for everyone who doesn't have one yet, keeping their current passwords
+  // mode "keep": current passwords · mode "2026": password = username + 2026 (lowercase)
+  const activateAll=async(mode="keep")=>{
+    const pwFor=u=>mode==="2026"?(u.u||"").toLowerCase()+"2026":u.pw;
+    const todo=users.filter(u=>u.u&&pwFor(u)&&!access[loginEmail(u)]);
+    if(!todo.length){alert("Everyone already has a login.");return;}
+    if(!window.confirm("Create logins for "+todo.length+" people?\n\n"+todo.map(u=>"• "+u.name+"   username: "+u.u+"   password: "+(mode==="2026"?pwFor(u):"(their current one)")).join("\n")))return;
+    setBusy(true);const ok=[],skipped=[];
+    for(const u of todo){
+      try{await sbSignup(loginEmail(u),pwFor(u));await sbUpsertAccess(accessRow(u));ok.push(u.name+" → "+u.u+(mode==="2026"?" / "+pwFor(u):""));}
+      catch(e){skipped.push(u.name+": "+(/already|registered|exists/i.test(e.message)?"a login with this username already exists — use its own Create login button":e.message));}
+    }
+    await loadAccess();setBusy(false);
+    alert("Done. "+ok.length+" logins created"+(mode==="2026"?":\n\n"+ok.join("\n"):" — same usernames and passwords as before.")+(skipped.length?"\n\nNot created:\n"+skipped.join("\n"):""));
+  };
+  const save=async()=>{
+    if(!f.u||!f.name){alert("Username and name required.");return;}
+    if(!editU&&(!f.pw||f.pw.length<8)){alert("Password must be at least 8 characters.");return;}
     if(!editU&&users.find(x=>x.u===f.u)){alert("Username taken.");return;}
-    const newPct=f.pct===""||f.pct===null||f.pct===undefined?3:parseFloat(f.pct);
+    const newPct=f.role==="sdr"?0:(f.pct===""||f.pct===null||f.pct===undefined?3:parseFloat(f.pct));
+    const{pw,_closer,...fx}=f;// password is only sent to Supabase Auth, never saved in the users list
+    const ff={...fx,email:(fx.email||"").trim(),...(fx.role==="sdr"?{permDrv:[],tempDrv:[]}:{sdrTrucks:undefined})};
+    setBusy(true);
+    try{
+      if(editU){
+        if(loginEmail(editU)!==loginEmail(ff)){alert("Username can't be changed (it's the login). Create a new user instead.");setBusy(false);return;}
+        if(access[loginEmail(ff)])await sbUpsertAccess(accessRow(ff));
+      }else{
+        const used=await createLogin(ff,pw);
+        if(used)alert("User created.\n\nUsername: "+ff.u+"\nPassword: "+used+"\n\nSend these privately.");
+      }
+      // "Can close leads" checkbox -> admin-only lead_closers table
+      const ce=loginEmail(ff),want=!!_closer&&ff.role!=="sdr",has=closerSet.has(ce);
+      if(want&&!has)await sbApi("lead_closers",{method:"POST",body:{email:ce,name:ff.name},prefer:"return=minimal"});
+      else if(!want&&has)await sbApi("lead_closers?email=eq."+encodeURIComponent(ce),{method:"DELETE"});
+      else if(want&&has&&editU&&editU.name!==ff.name)await sbApi("lead_closers?email=eq."+encodeURIComponent(ce),{method:"PATCH",body:{name:ff.name}});
+    }catch(e){if(e.message!=="Cancelled")alert(e.message);setBusy(false);loadClosers();return;}
+    setBusy(false);loadAccess();loadClosers();
     if(editU){
       // If name changed, update all loads that reference the old name
       const oldName=editU.name;
-      const newName=f.name;
+      const newName=ff.name;
       if(oldName!==newName){
         setLoads(loads.map(l=>({...l,
           dispatcher:l.dispatcher===oldName?newName:l.dispatcher,
           driver:l.driver===oldName?newName:l.driver,
         })));
       }
-      setUsers(users.map(x=>x.id===editU.id?{...x,...f,pct:newPct}:x));
+      setUsers(users.map(x=>{if(x.id!==editU.id)return x;const{_closer:_c,...rest}=ff;return{...x,...rest,pct:newPct};}));
     }else{
-      setUsers([...users,{...f,id:Date.now(),pct:newPct}]);
+      setUsers([...users,{...ff,id:Date.now(),pct:newPct}]);
     }
     sm(false);
   };
@@ -2634,22 +2770,40 @@ function Users({ctx}){
     }));
     alert("Done! Now you can safely change the rate.");
   };
-  const del=(id)=>{if(id===sess.id)return;if(window.confirm("Remove user?"))setUsers(users.filter(x=>x.id!==id))};
+  // Removing a user revokes their access on the server immediately
+  const del=async(id)=>{
+    if(id===sess.id)return;
+    const u=users.find(x=>x.id===id);
+    if(!window.confirm("Remove user and revoke their login?"))return;
+    try{if(u&&access[loginEmail(u)])await sbDeleteAccess(loginEmail(u));}catch(e){alert(e.message);return;}
+    setUsers(users.filter(x=>x.id!==id));loadAccess();
+  };
+  const revoke=async(u)=>{
+    if(!window.confirm("Revoke login for "+u.name+"? They will lose access immediately."))return;
+    try{await sbDeleteAccess(loginEmail(u));loadAccess();}catch(e){alert(e.message);}
+  };
   const togD=(type,nm)=>{const a=f[type]||[];sf(x=>({...x,[type]:a.includes(nm)?a.filter(d=>d!==nm):[...a,nm]}))};
+  // SDR trucks: [{driver, fee (4|5|6), start (optional YYYY-MM-DD override of first completed load)}]
+  const isSdrForm=f.role==="sdr";
+  const sdrT=f.sdrTrucks||[];
+  const togSdr=nm=>sf(x=>{const a=x.sdrTrucks||[];return{...x,sdrTrucks:a.find(t=>t.driver===nm)?a.filter(t=>t.driver!==nm):[...a,{driver:nm,fee:5,start:""}]};});
+  const updSdr=(nm,k,v)=>sf(x=>({...x,sdrTrucks:(x.sdrTrucks||[]).map(t=>t.driver===nm?{...t,[k]:v}:t)}));
   const stats=(nm)=>{const ml=loads.filter(l=>l.dispatcher?.toUpperCase()===nm?.toUpperCase());return{n:ml.length,rev:ml.reduce((s,l)=>s+(l.amount||0),0)}};
   return(<>
-    <div className="tb"><div><div className="pt">Users</div><div className="ps">Manage dispatchers, roles, driver assignments</div></div><button className="btn btn-p" onClick={()=>open(null)}>+ Add User</button></div>
+    <div className="tb"><div><div className="pt">Users</div><div className="ps">Manage dispatchers, roles, driver assignments</div></div><div style={{display:"flex",gap:8,flexWrap:"wrap"}}><button className="btn btn-s" disabled={busy} onClick={()=>activateAll("keep")}>🔐 Create logins (keep passwords)</button><button className="btn btn-s" disabled={busy} onClick={()=>activateAll("2026")}>🔐 Create logins: username + 2026</button><button className="btn btn-p" onClick={()=>open(null)}>+ Add User</button></div></div>
     <div className="con">
-      <div className="al ali" style={{marginBottom:14}}>Dispatchers see only their own loads. Their profit shows at their % rate. Admins see everything.</div>
-      <div className="tw"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Fee %</th><th>Email</th><th>Password</th><th>Perm. Drivers</th><th>Loads</th><th>Revenue</th><th></th></tr></thead>
+      <div className="al ali" style={{marginBottom:14}}>Dispatchers see only their own loads. Their profit shows at their % rate. Admins see everything. SDRs (external) see only the performance of the trucks you assign them.</div>
+      <div className="tw"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Fee %</th><th>Email</th><th>Login</th><th>Drivers / Trucks</th><th>Loads</th><th>Revenue</th><th></th></tr></thead>
       <tbody>{users.map(u=>{const s=stats(u.name);return(
         <tr key={u.id}>
-          <td style={{fontWeight:700}}>{u.name}</td><td style={{fontFamily:"monospace",fontSize:11,color:"var(--mu)"}}>{u.u}</td>
-          <td><span className={"bdg "+(u.role==="admin"?"bp":"bb")}>{u.role}</span></td>
-          <td style={{fontWeight:700,color:"var(--acc)"}}>{(u.id===1||u.id===2)?<span style={{color:"var(--green)"}}>0%</span>:(u.pct||3)+"%"}</td>
-          <td style={{fontSize:11,color:"var(--mu)"}}>{u.email}</td>
-          <td>{spw[u.id]?<span style={{fontFamily:"monospace",fontSize:11,color:"var(--amb)"}}>{u.pw}</span>:<button className="btn btn-s btn-sm" onClick={()=>ssw(p=>({...p,[u.id]:true}))}>Show</button>}</td>
-          <td style={{fontSize:11}}>{(u.permDrv||[]).join(", ")||<span style={{color:"var(--mu)"}}>—</span>}</td>
+          <td style={{fontWeight:700}}>{u.name}{closerSet.has(loginEmail(u))&&<span className="bdg bg" style={{marginLeft:6}} title="Can close leads">🤝 closer</span>}</td><td style={{fontFamily:"monospace",fontSize:11,color:"var(--mu)"}}>{u.u}</td>
+          <td><span className={"bdg "+(u.role==="admin"?"bp":u.role==="sdr"?"ba":"bb")}>{u.role}</span></td>
+          <td style={{fontWeight:700,color:"var(--acc)"}}>{u.role==="sdr"?<span style={{color:"var(--mu)"}}>—</span>:(u.id===1||u.id===2)?<span style={{color:"var(--green)"}}>0%</span>:(u.pct||3)+"%"}</td>
+          <td style={{fontSize:11,color:"var(--mu)"}}>{u.email||"—"}</td>
+          <td>{(()=>{const a=access[loginEmail(u)];
+            if(!a)return<button className="btn btn-p btn-sm" disabled={busy} onClick={()=>activate(u)}>🔐 Create login</button>;
+            return<div style={{display:"flex",gap:5,alignItems:"center"}}><span className={"bdg "+(a.role===u.role?"bg":"ba")} title={a.role!==u.role?"Server role differs — click Edit → Save to sync":""}>✓ {a.role}</span>{u.id!==sess.id&&<button className="btn btn-s btn-sm" onClick={()=>revoke(u)} title="Revoke login">⛔</button>}</div>;})()}</td>
+          <td style={{fontSize:11}}>{u.role==="sdr"?((u.sdrTrucks||[]).map(t=>t.driver+" ("+t.fee+"%)").join(", ")||<span style={{color:"var(--mu)"}}>no trucks</span>):((u.permDrv||[]).join(", ")||<span style={{color:"var(--mu)"}}>—</span>)}</td>
           <td><span className="bdg bx">{s.n}</span></td><td style={{color:"var(--green)",fontWeight:600}}>${s.rev.toLocaleString()}</td>
           <td><div style={{display:"flex",gap:5}}><button className="btn btn-s btn-sm" onClick={()=>open(u)}>Edit</button>{u.id!==sess.id&&<button className="btn btn-d btn-sm" onClick={()=>del(u.id)}>✕</button>}</div></td>
         </tr>);})}</tbody></table></div>
@@ -2659,16 +2813,31 @@ function Users({ctx}){
           <div className="mb">
             <div className="fg" style={{marginBottom:14}}>
               <div className="fl"><label>Full Name *</label><input value={f.name} onChange={e=>sf(x=>({...x,name:e.target.value}))}/></div>
-              <div className="fl"><label>Role</label><select value={f.role} onChange={e=>sf(x=>({...x,role:e.target.value}))}><option value="dispatcher">Dispatcher</option><option value="admin">Admin</option></select></div>
-              <div className="fl"><label>Username *</label><input value={f.u} onChange={e=>sf(x=>({...x,u:e.target.value.toLowerCase().trim()}))}/></div>
-              <div className="fl"><label>Password *</label><input value={f.pw} onChange={e=>sf(x=>({...x,pw:e.target.value}))}/></div>
-              <div className="fl"><label>Email</label><input type="email" value={f.email} onChange={e=>sf(x=>({...x,email:e.target.value}))}/></div>
-              <div className="fl"><label>Current Fee %</label>
+              <div className="fl"><label>Role</label><select value={f.role} onChange={e=>sf(x=>({...x,role:e.target.value}))}><option value="dispatcher">Dispatcher</option><option value="admin">Admin</option><option value="sdr">SDR (external)</option></select></div>
+              <div className="fl"><label>Username * (used to log in)</label><input value={f.u} disabled={!!editU} onChange={e=>sf(x=>({...x,u:e.target.value.toLowerCase().replace(/[^a-z0-9._-]/g,"")}))}/></div>
+              {!editU&&<div className="fl"><label>Password * (min 8 — not stored in the app)</label><input value={f.pw} onChange={e=>sf(x=>({...x,pw:e.target.value}))}/></div>}
+              <div className="fl"><label>Email (contact, optional)</label><input type="email" value={f.email} onChange={e=>sf(x=>({...x,email:e.target.value}))}/></div>
+              {editU&&<div className="fl" style={{fontSize:11,color:"var(--mu)",alignSelf:"end"}}>To reset a password: Supabase → Authentication → Users.</div>}
+              {!isSdrForm&&<div className="fl"><label>Current Fee %</label>
               <div style={{display:"flex",gap:8,alignItems:"center"}}>
                 <input type="number" step="0.1" value={f.pct} onChange={e=>sf(x=>({...x,pct:e.target.value}))} style={{width:80}}/>
                 {editU&&<div style={{fontSize:11,color:"var(--mu)"}}>Change → new loads use new %</div>}
-              </div></div>
+              </div></div>}
             </div>
+            {!isSdrForm&&<label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,margin:"0 0 14px",cursor:"pointer"}}><input type="checkbox" checked={!!f._closer} onChange={e=>sf(x=>({...x,_closer:e.target.checked}))}/> 🤝 <b>Can close leads</b> <span style={{color:"var(--mu)"}}>(appears in “Transfer to Closer”)</span></label>}
+            {isSdrForm&&<>
+              <div style={{fontSize:10,fontWeight:700,color:"var(--mu)",letterSpacing:".5px",textTransform:"uppercase",marginBottom:8}}>Referred Trucks (SDR can see only these)</div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>{allDrvs.map(n=>{const sel=!!sdrT.find(t=>t.driver===n);return(<div key={n} onClick={()=>togSdr(n)} style={{background:sel?"rgba(245,158,11,.15)":"var(--sf)",border:"1px solid "+(sel?"var(--amb)":"var(--b)"),borderRadius:5,padding:"5px 10px",cursor:"pointer",fontSize:12,userSelect:"none",fontWeight:sel?700:400,color:sel?"var(--amb)":"var(--tx)"}}>{sel?"✓ ":""}{n}</div>);})}</div>
+              {sdrT.length>0&&<div className="tw" style={{marginBottom:14}}><table><thead><tr><th>Truck / Driver</th><th>Carrier Dispatch Fee</th><th>SDR Rate</th><th>Start (optional)</th></tr></thead>
+                <tbody>{sdrT.map(t=><tr key={t.driver}>
+                  <td style={{fontWeight:700}}>{t.driver}</td>
+                  <td><select value={t.fee} onChange={e=>updSdr(t.driver,"fee",parseInt(e.target.value))}>{Object.keys(SDR_TIERS).map(k=><option key={k} value={k}>{k}%</option>)}</select></td>
+                  <td style={{color:"var(--amb)",fontWeight:700}}>{SDR_TIERS[t.fee]}% of revenue</td>
+                  <td><input type="date" value={t.start||""} onChange={e=>updSdr(t.driver,"start",e.target.value)} title="Leave empty = first completed load"/></td>
+                </tr>)}</tbody></table></div>}
+              <div className="al ali" style={{marginBottom:14,fontSize:11}}>Commission window = {SDR_MONTHS} months from each truck's first completed load (or the start date you set). The SDR only sees these trucks' loads, revenue and commission — no brokers, carriers, other users or company data.</div>
+            </>}
+            {!isSdrForm&&<>
             <div style={{fontSize:10,fontWeight:700,color:"var(--mu)",letterSpacing:".5px",textTransform:"uppercase",marginBottom:8}}>Permanent Drivers</div>
             <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:14}}>{allDrvs.map(n=>{const sel=(f.permDrv||[]).includes(n);return(<div key={n} onClick={()=>togD("permDrv",n)} style={{display:"flex",alignItems:"center",gap:6,background:sel?"rgba(34,197,94,.15)":"var(--sf)",border:"1px solid "+(sel?"#22c55e":"var(--b)"),borderRadius:5,padding:"5px 10px",cursor:"pointer",fontSize:12,userSelect:"none",transition:"all .1s"}}>
               <div style={{width:14,height:14,borderRadius:3,border:"2px solid "+(sel?"#22c55e":"var(--b)"),background:sel?"#22c55e":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
@@ -2683,8 +2852,9 @@ function Users({ctx}){
               </div>
               <span style={{fontWeight:sel?700:400,color:sel?"var(--green)":"var(--tx)"}}>{n}</span>
             </div>);})}</div>
+            </>}
           </div>
-          <div className="mf"><button className="btn btn-s" onClick={()=>sm(false)}>Cancel</button><button className="btn btn-p" onClick={save}>{editU?"Save":"Create User"}</button></div>
+          <div className="mf"><button className="btn btn-s" onClick={()=>sm(false)}>Cancel</button><button className="btn btn-p" disabled={busy} onClick={save}>{busy?"Saving…":editU?"Save":"Create User"}</button></div>
         </div>
       </div>}
     </div>
@@ -3202,6 +3372,632 @@ function Performance({ctx}){
   </>);
 }
 
+// ── SALES: leads pipeline + leaderboard (shared by the staff app and the SDR portal).
+// Leads live in the "leads" table; the database decides who sees/edits what:
+// everyone sees only their own leads, admins (closers) see all, only admins can close/lose.
+const LEAD_STAGES=[
+  {id:"new",l:"New",c:"bx"},
+  {id:"interested",l:"Interested",c:"bb"},
+  {id:"transferred",l:"Transferred to Closer",c:"ba"},
+  {id:"closed",l:"Closed ✓",c:"bg"},
+  {id:"lost",l:"Lost",c:"br"},
+];
+const stageOf=id=>LEAD_STAGES.find(s=>s.id===id)||LEAD_STAGES[0];
+const isOpenLead=l=>l.stage!=="closed"&&l.stage!=="lost";
+async function sbApi(path,{method="GET",body,prefer}={}){
+  const r=await fetch(SB+"/rest/v1/"+path,{method,headers:{...SBH,...(prefer?{"Prefer":prefer}:{})},body:body?JSON.stringify(body):undefined});
+  const t=await r.text();let d=null;try{d=t?JSON.parse(t):null;}catch{}
+  if(!r.ok)throw new Error((d&&d.message)||t||"Request failed");
+  return d;
+}
+
+function Leads({isAdmin,myEmail}){
+  const[leads,setLeads]=useState(null);const[err,setErr]=useState("");
+  const[stage,setStage]=useState("open");// open | all | a stage id
+  const[owner,setOwner]=useState("All");
+  const[mine,setMine]=useState(false);// admin: only leads transferred to me
+  const[closers,setClosers]=useState([]);
+  const[edit,setEdit]=useState(null);// lead being edited, or {} for a new one
+  const[xfer,setXfer]=useState(null);const[xferTo,setXferTo]=useState("");
+  const[busy,setBusy]=useState(false);
+  const[imp,setImp]=useState(false);// CSV import dialog
+  const load=()=>sbApi("leads?select=*&order=updated_at.desc").then(d=>{setLeads(d||[]);setErr("");}).catch(e=>setErr(e.message));
+  React.useEffect(()=>{
+    load();
+    sbApi("rpc/list_closers",{method:"POST",body:{}}).then(d=>setClosers(d||[])).catch(()=>{});
+    const iv=setInterval(load,30000);return()=>clearInterval(iv);
+  },[]);
+  const save=async(patch,id)=>{
+    setBusy(true);
+    try{
+      if(id)await sbApi("leads?id=eq."+id,{method:"PATCH",body:patch,prefer:"return=representation"});
+      else await sbApi("leads",{method:"POST",body:patch,prefer:"return=representation"});
+      await load();return true;
+    }catch(e){alert(/leads_mc_claim|duplicate key/i.test(e.message)?"This MC # is already claimed by another rep. First to claim owns the carrier.":e.message);return false;}
+    finally{setBusy(false);}
+  };
+  const close=l=>{if(window.confirm("Mark "+l.company+" as CLOSED (won)?\n\nNext: add the carrier's trucks in Drivers, then assign them to "+(l.owner_name||"the SDR")+" in Users so their commission starts."))save({stage:"closed"},l.id);};
+  const lose=l=>{if(window.confirm("Mark "+l.company+" as LOST?"))save({stage:"lost"},l.id);};
+
+  const all=leads||[];
+  const owners=[...new Set(all.map(l=>l.owner_name).filter(Boolean))].sort();
+  const base=all.filter(l=>(owner==="All"||l.owner_name===owner)&&(!mine||l.closer_email===myEmail));
+  const inStage=(l,s)=>s==="all"||(s==="open"?isOpenLead(l):l.stage===s);
+  const shown=base.filter(l=>inStage(l,stage)).sort((a,b)=>(b.updated_at||"").localeCompare(a.updated_at||""));
+  const today=new Date().toISOString().slice(0,10);
+  const chip=(id,label)=><button key={id} onClick={()=>setStage(id)} className={"btn btn-sm "+(stage===id?"btn-p":"btn-s")}>{label} <span style={{opacity:.7,marginLeft:4}}>{base.filter(l=>inStage(l,id)).length}</span></button>;
+  const d10=s=>s?new Date(s).toLocaleDateString("en-US"):"";
+
+  return(<>
+    <div className="tb">
+      <div><div className="pt">🎯 Leads Pipeline</div><div className="ps">{isAdmin?"All leads — assign a closer to Interested leads, then mark Closed or Lost":"Your leads — mark them Interested when ready; an admin assigns a closer. Leads transferred to you appear here to close."}</div></div>
+      <div style={{display:"flex",gap:8}}>
+        <button className="btn btn-s" onClick={()=>setImp(true)}>📂 Import CSV</button>
+        <button className="btn btn-p" onClick={()=>setEdit({})}>+ New Lead</button>
+      </div>
+    </div>
+    <div className="con">
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
+        {chip("open","Open")}{LEAD_STAGES.map(s=>chip(s.id,s.l))}{chip("all","All")}
+      </div>
+      {(isAdmin||all.some(l=>l.closer_email===myEmail))&&<div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",marginBottom:12}}>
+        {isAdmin&&<select value={owner} onChange={e=>setOwner(e.target.value)}><option value="All">All people</option>{owners.map(o=><option key={o}>{o}</option>)}</select>}
+        <label style={{fontSize:12,display:"flex",alignItems:"center",gap:6,cursor:"pointer"}}><input type="checkbox" checked={mine} onChange={e=>setMine(e.target.checked)}/> Transferred to me</label>
+      </div>}
+      {err&&<div className="al ald" style={{marginBottom:12}}>{err}</div>}
+      {!isAdmin&&all.filter(l=>l.stage==="transferred"&&l.closer_email===myEmail).length>0&&!mine&&<div className="al" style={{marginBottom:12,background:"rgba(34,197,94,.12)",border:"1px solid var(--green)",color:"var(--green)",display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+        🤝 <b>{all.filter(l=>l.stage==="transferred"&&l.closer_email===myEmail).length} lead(s) transferred to you to close</b>
+        <button className="btn btn-p btn-sm" onClick={()=>{setStage("transferred");setMine(true);}}>Show them</button>
+      </div>}
+      {isAdmin&&all.filter(l=>l.stage==="interested").length>0&&stage!=="interested"&&<div className="al" style={{marginBottom:12,background:"rgba(245,158,11,.12)",border:"1px solid var(--amb)",color:"var(--amb)",display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+        ⏳ <b>{all.filter(l=>l.stage==="interested").length} interested lead{all.filter(l=>l.stage==="interested").length>1?"s":""} waiting for a closer</b>
+        <button className="btn btn-p btn-sm" onClick={()=>{setStage("interested");setOwner("All");setMine(false);}}>Show them</button>
+      </div>}
+      {!leads&&!err&&<div style={{padding:30,textAlign:"center",color:"var(--mu)"}}>Loading…</div>}
+      {leads&&shown.length===0&&<div style={{padding:30,textAlign:"center",color:"var(--mu)"}}>No leads here yet. Click <b>+ New Lead</b> to add a carrier you're talking to.</div>}
+      {shown.map(l=>{const st=stageOf(l.stage);const own=l.owner_email===myEmail;const open=isOpenLead(l);const late=open&&l.followup&&l.followup<today;return(
+        <div key={l.id} className="card" style={{padding:14,marginBottom:10}}>
+          <div style={{display:"flex",justifyContent:"space-between",gap:8,flexWrap:"wrap"}}>
+            <div>
+              <div style={{fontWeight:800,fontSize:14}}>{l.company}{l.mc?<span style={{color:"var(--mu)",fontWeight:400,fontSize:12}}> · MC {l.mc}</span>:null}</div>
+              <div style={{fontSize:11,color:"var(--mu)",marginTop:2}}>
+                {[l.contact,l.phone,l.email].filter(Boolean).join(" · ")||"No contact yet"}
+                {l.trucks?" · "+l.trucks+" truck"+(l.trucks>1?"s":""):""}{l.equipment?" · "+l.equipment:""}
+              </div>
+            </div>
+            <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+              {(isAdmin||!own)&&l.owner_name&&<span className="bdg bp">by {l.owner_name}</span>}
+              <span className={"bdg "+st.c}>{st.l}</span>
+            </div>
+          </div>
+          {(l.closer_name||l.followup)&&<div style={{fontSize:11,marginTop:6,display:"flex",gap:12,flexWrap:"wrap"}}>
+            {l.closer_name&&<span style={{color:"var(--amb)"}}>Closer: <b>{l.closer_name}</b></span>}
+            {l.followup&&open&&<span style={{color:late?"var(--red)":"var(--mu)"}}>{late?"⚠️ Follow-up overdue: ":"Next follow-up: "}{d10(l.followup+"T12:00")}</span>}
+            {l.stage==="closed"&&l.closed_at&&<span style={{color:"var(--green)"}}>Closed {d10(l.closed_at)}</span>}
+          </div>}
+          {l.notes&&<div style={{fontSize:12,marginTop:8,whiteSpace:"pre-wrap",background:"var(--sf)",borderRadius:6,padding:"6px 10px"}}>{l.notes}</div>}
+          <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:10,alignItems:"center"}}>
+            {open&&(own||isAdmin)&&l.stage==="new"&&<button className="btn btn-s btn-sm" disabled={busy} onClick={()=>save({stage:"interested"},l.id)}>→ Interested</button>}
+            {open&&isAdmin&&["new","interested"].includes(l.stage)&&xfer!==l.id&&<button className="btn btn-p btn-sm" disabled={busy} onClick={()=>{setXfer(l.id);setXferTo(closers[0]?.email||"");}}>→ Transfer to Closer</button>}
+            {xfer===l.id&&<>
+              <select value={xferTo} onChange={e=>setXferTo(e.target.value)}>{closers.map(c=><option key={c.email} value={c.email}>{c.name}{c.role==="dispatcher"?" (dispatcher)":""}</option>)}</select>
+              <button className="btn btn-p btn-sm" disabled={busy||!xferTo} onClick={async()=>{if(await save({stage:"transferred",closer_email:xferTo},l.id))setXfer(null);}}>Transfer</button>
+              <button className="btn btn-s btn-sm" onClick={()=>setXfer(null)}>Cancel</button>
+            </>}
+            {(isAdmin||(l.stage==="transferred"&&l.closer_email===myEmail))&&open&&<><button className="btn btn-sm" style={{background:"var(--green)",color:"#fff"}} disabled={busy} onClick={()=>close(l)}>✓ Closed</button><button className="btn btn-d btn-sm" disabled={busy} onClick={()=>lose(l)}>✕ Lost</button></>}
+            {isAdmin&&!open&&<button className="btn btn-s btn-sm" disabled={busy} onClick={()=>save({stage:"transferred"},l.id)}>↺ Reopen</button>}
+            {((own&&open)||isAdmin||(open&&l.closer_email===myEmail))&&<button className="btn btn-s btn-sm" onClick={()=>setEdit(l)}>Edit</button>}
+            <span style={{marginLeft:"auto",fontSize:10,color:"var(--mu)"}}>Added {d10(l.created_at)}</span>
+          </div>
+        </div>);})}
+    </div>
+    {edit&&<LeadModal lead={edit} busy={busy} closers={closers} isAdmin={isAdmin} myEmail={myEmail} onClose={()=>setEdit(null)} onSave={async f=>{if(await save(f,edit.id))setEdit(null);}}/>}
+    {imp&&<LeadImport onClose={()=>setImp(false)} onDone={(n,t)=>{setImp(false);setStage("open");load();alert(n+" leads imported."+(t?"\n"+t+" skipped — already claimed by a rep.":""));}}/>}
+  </>);
+}
+
+// CSV import for leads. Workflow: reps cold-call in Google Sheets, then upload the carriers that are
+// interested. Columns are matched automatically; a Status column sets the stage:
+//   interested / hot / warm / needs closing / transfer / closed  -> Interested (closing happens in the app)
+//   not interested / lost / dead / no / DNC                      -> row skipped
+//   anything else or no Status column                            -> New
+// MC #s already claimed by ANY rep are skipped (first to claim owns the carrier).
+const LEAD_FIELDS=[
+  {k:"company",l:"Company *",re:/company|carrier|business|legal|dba|^name$/i},
+  {k:"mc",l:"MC #",re:/\bmc\b|mc ?#|mc ?num|docket/i},
+  {k:"contact",l:"Contact",re:/contact|owner|person|first ?name|full ?name/i},
+  {k:"phone",l:"Phone",re:/phone|mobile|cell|tel/i},
+  {k:"email",l:"Email",re:/e-?mail/i},
+  {k:"trucks",l:"# Trucks",re:/truck|power ?units|units|fleet/i},
+  {k:"equipment",l:"Equipment",re:/equip|trailer|type/i},
+  {k:"followup",l:"Follow-up date",re:/follow|next ?(call|date)/i},
+  {k:"status",l:"Status",re:/status|stage|result|outcome|disposition/i},
+  {k:"notes",l:"Notes",re:/note|comment|remark/i},
+];
+const mcNorm=s=>((s||"")+"").replace(/\D/g,"");
+const statusToStage=s=>{
+  s=(s||"").toLowerCase().trim();
+  if(!s)return"new";
+  if(/not ?interest|lost|dead|\bno\b|dnc|do not call|wrong|bad/.test(s))return null;// skip
+  if(/interest|hot|warm|clos|transfer|yes|call ?back/.test(s))return"interested";
+  return"new";
+};
+function parseCSV(text){
+  text=text.replace(/^﻿/,"");
+  const first=text.split(/\r?\n/)[0]||"";
+  const cnt=ch=>first.split(ch).length;
+  const d=[",",";","\t"].sort((a,b)=>cnt(b)-cnt(a))[0];
+  const rows=[];let row=[],f="",q=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(q){if(c==='"'){if(text[i+1]==='"'){f+='"';i++;}else q=false;}else f+=c;}
+    else if(c==='"')q=true;
+    else if(c===d){row.push(f);f="";}
+    else if(c==="\n"||c==="\r"){if(c==="\r"&&text[i+1]==="\n")i++;row.push(f);rows.push(row);row=[];f="";}
+    else f+=c;
+  }
+  if(f!==""||row.length){row.push(f);rows.push(row);}
+  return rows.filter(r=>r.some(x=>(x||"").trim()!==""));
+}
+function LeadImport({onClose,onDone}){
+  const[rows,setRows]=useState(null);// [header, ...data]
+  const[map,setMap]=useState({});// field -> column index ("" = none)
+  const[claimed,setClaimed]=useState(null);// Set of MC #s already owned by someone
+  const[busy,setBusy]=useState(false);const[msg,setMsg]=useState("");
+  const template="Company,MC,Contact,Phone,Email,Trucks,Equipment,Status,Follow-up,Notes\nExample Trucking LLC,1234567,John Smith,555-123-4567,john@example.com,3,Dry Van,Interested,2026-10-05,Wants Midwest lanes at 5%\n";
+  // Safari-safe download: data: link attached to the page (blob links are often blocked when the app is opened from a file)
+  const dlTemplate=()=>{const a=document.createElement("a");a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(template);a.download="leads-template.csv";a.style.display="none";document.body.appendChild(a);a.click();setTimeout(()=>a.remove(),1000);};
+  const load=text=>{
+    const r=parseCSV(text);if(r.length<2){setMsg("No data rows found. The first row must be the column names.");return;}
+    const hdr=r[0].map(h=>(h||"").trim());const used=new Set();const m={};
+    // match specific fields first so "Contact Name" goes to Contact, not Company
+    ["email","phone","mc","trucks","equipment","followup","status","notes","contact","company"].forEach(k=>{
+      const fd=LEAD_FIELDS.find(x=>x.k===k);const i=hdr.findIndex((h,ix)=>!used.has(ix)&&fd.re.test(h));
+      if(i>=0){m[k]=i;used.add(i);}else m[k]="";
+    });
+    if(m.company===""){const i=hdr.findIndex((h,ix)=>!used.has(ix));if(i>=0)m.company=i;}
+    setRows(r);setMap(m);setMsg("");setClaimed(null);
+  };
+  const onFile=e=>{const file=e.target.files[0];if(!file)return;const rd=new FileReader();rd.onload=ev=>load(ev.target.result);rd.readAsText(file);};
+  const cell=(r,k)=>map[k]===""||map[k]===undefined?"":((r[map[k]]||"")+"").trim();
+  const toDate=s=>{if(!s)return null;if(/^\d{4}-\d{2}-\d{2}$/.test(s))return s;const d=new Date(s);if(isNaN(d))return null;return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");};// local date, no time-zone shift
+  const data=rows?rows.slice(1).map(r=>({
+    company:cell(r,"company"),mc:cell(r,"mc"),contact:cell(r,"contact"),phone:cell(r,"phone"),email:cell(r,"email"),
+    trucks:parseInt(cell(r,"trucks"))||null,equipment:cell(r,"equipment")||null,followup:toDate(cell(r,"followup")),notes:cell(r,"notes"),
+    stage:statusToStage(cell(r,"status")),
+  })):[];
+  // Ask the database which MC #s are already claimed by anyone (re-checked whenever the MC column changes)
+  const mcCol=map.mc;
+  React.useEffect(()=>{
+    if(!rows)return;
+    const mcs=[...new Set(data.map(d=>mcNorm(d.mc)).filter(Boolean))];
+    if(!mcs.length){setClaimed(new Set());return;}
+    setClaimed(null);
+    sbApi("rpc/claimed_mcs",{method:"POST",body:{p_mcs:mcs}}).then(d=>setClaimed(new Set((d||[]).map(x=>typeof x==="string"?x:Object.values(x)[0])))).catch(e=>{setMsg("Could not check claimed MC #s: "+e.message);setClaimed(new Set());});
+  },[rows,mcCol]);
+  const noCompany=data.filter(d=>!d.company).length;
+  const notInterested=data.filter(d=>d.company&&d.stage===null).length;
+  const seen=new Set();let taken=0,dupInFile=0;
+  const toAdd=data.filter(d=>{
+    if(!d.company||d.stage===null)return false;
+    const mc=mcNorm(d.mc);
+    if(mc&&claimed&&claimed.has(mc)){taken++;return false;}
+    if(mc&&seen.has(mc)){dupInFile++;return false;}
+    if(mc)seen.add(mc);return true;
+  });
+  const nInt=toAdd.filter(d=>d.stage==="interested").length;
+  const go=async()=>{
+    setBusy(true);setMsg("");
+    let added=0,lateTaken=0;
+    try{
+      for(let i=0;i<toAdd.length;i+=200){
+        const batch=toAdd.slice(i,i+200);
+        try{await sbApi("leads",{method:"POST",body:batch,prefer:"return=minimal"});added+=batch.length;}
+        catch(e){
+          if(!/leads_mc_claim|duplicate key/i.test(e.message))throw e;
+          // someone claimed one of these a moment ago — add the rest one by one
+          for(const d of batch){try{await sbApi("leads",{method:"POST",body:d,prefer:"return=minimal"});added++;}catch(e2){if(/leads_mc_claim|duplicate key/i.test(e2.message))lateTaken++;else throw e2;}}
+        }
+      }
+      onDone(added,taken+lateTaken);
+    }catch(e){setMsg("Import stopped after "+added+" leads: "+e.message);}
+    setBusy(false);
+  };
+  return(
+    <div className="modal-bg" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="modal" style={{maxWidth:760}}>
+        <div className="mh"><div style={{fontWeight:700,fontSize:13}}>Import Leads from CSV</div><button className="xbtn" onClick={onClose}>✕</button></div>
+        <div className="mb">
+          {!rows&&<>
+            <div className="al ali" style={{marginBottom:12,fontSize:12,lineHeight:1.6}}>
+              Upload the carriers that are <b>interested</b> from your calling sheet.<br/>
+              Google Sheets: <b>File → Download → CSV</b>. Excel: <b>File → Save As → CSV</b>.<br/>
+              A <b>Status</b> column is used automatically: <i>Interested / Hot / Needs closing</i> → Interested · <i>Not interested / Lost / DNC</i> → skipped · anything else → New.<br/>
+              Carriers whose MC # is already claimed by another rep are skipped — first to claim owns the carrier.
+            </div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+              <label className="btn btn-p" style={{cursor:"pointer"}}>📂 Choose CSV file<input type="file" accept=".csv,text/csv,.txt" onChange={onFile} style={{display:"none"}}/></label>
+              <button className="btn btn-s" onClick={dlTemplate}>⬇ Download template</button>
+            </div>
+          </>}
+          {rows&&<>
+            <div style={{fontSize:10,fontWeight:700,color:"var(--mu)",textTransform:"uppercase",letterSpacing:".5px",marginBottom:8}}>Match your columns</div>
+            <div className="fg" style={{marginBottom:12}}>
+              {LEAD_FIELDS.map(fd=><div key={fd.k} className="fl"><label>{fd.l}</label>
+                <select value={map[fd.k]} onChange={e=>setMap(m=>({...m,[fd.k]:e.target.value===""?"":parseInt(e.target.value)}))}>
+                  <option value="">— skip —</option>{rows[0].map((h,i)=><option key={i} value={i}>{h||"Column "+(i+1)}</option>)}
+                </select></div>)}
+            </div>
+            <div style={{fontSize:10,fontWeight:700,color:"var(--mu)",textTransform:"uppercase",letterSpacing:".5px",marginBottom:6}}>Preview (first 5)</div>
+            <div className="tw" style={{marginBottom:10}}><table><thead><tr><th>Company</th><th>MC</th><th>Contact</th><th>Phone</th><th>Trucks</th><th>Will be</th></tr></thead>
+              <tbody>{data.slice(0,5).map((d,i)=>{const mc=mcNorm(d.mc);const tk=mc&&claimed&&claimed.has(mc);const skip=!d.company||d.stage===null||tk;return<tr key={i} style={skip?{opacity:.45}:null}>
+                <td style={{fontWeight:700}}>{d.company||"(no company)"}</td><td>{d.mc}</td><td>{d.contact}</td><td>{d.phone}</td><td>{d.trucks||""}</td>
+                <td>{!d.company?"skipped — no company":d.stage===null?"skipped — not interested":tk?"skipped — already claimed":<span className={"bdg "+stageOf(d.stage).c}>{stageOf(d.stage).l}</span>}</td></tr>;})}</tbody></table></div>
+            {!claimed?<div style={{fontSize:12,color:"var(--mu)"}}>Checking which carriers are already claimed…</div>:
+            <div style={{fontSize:12,lineHeight:1.7}}>
+              <b style={{color:"var(--green)"}}>{toAdd.length}</b> leads will be added ({nInt} Interested, {toAdd.length-nInt} New)
+              {taken>0&&<div style={{color:"var(--amb)"}}>⚠️ {taken} skipped — MC # already claimed by a rep</div>}
+              {notInterested>0&&<div style={{color:"var(--mu)"}}>{notInterested} skipped — status "not interested"</div>}
+              {dupInFile>0&&<div style={{color:"var(--mu)"}}>{dupInFile} skipped — same MC # twice in the file</div>}
+              {noCompany>0&&<div style={{color:"var(--mu)"}}>{noCompany} skipped — no company name</div>}
+            </div>}
+          </>}
+          {msg&&<div className="al ald" style={{marginTop:10}}>{msg}</div>}
+        </div>
+        <div className="mf">
+          {rows&&<button className="btn btn-s" onClick={()=>{setRows(null);setMsg("");}}>← Other file</button>}
+          <button className="btn btn-s" onClick={onClose}>Cancel</button>
+          {rows&&<button className="btn btn-p" disabled={busy||!claimed||!toAdd.length} onClick={go}>{busy?"Importing…":"Import "+toAdd.length+" leads"}</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LeadModal({lead,busy,onClose,onSave,closers,isAdmin,myEmail}){
+  const[f,sf]=useState({company:lead.company||"",mc:lead.mc||"",contact:lead.contact||"",phone:lead.phone||"",email:lead.email||"",trucks:lead.trucks||"",equipment:lead.equipment||"Dry Van",followup:lead.followup||"",notes:lead.notes||"",
+    stage:lead.stage||"new",closer_email:lead.closer_email||""});
+  const inp=k=>({value:f[k],onChange:e=>sf(x=>({...x,[k]:e.target.value}))});
+  // Status choices: reps can go up to "Transferred to Closer"; only admins (closers) can set Closed / Lost
+  const canClose=isAdmin||(lead.stage==="transferred"&&lead.closer_email===myEmail);
+  const stages=LEAD_STAGES.filter(s=>isAdmin||s.id===lead.stage||(canClose&&["closed","lost"].includes(s.id))||!["transferred","closed","lost"].includes(s.id));// only admins transfer/close
+  const needsCloser=f.stage==="transferred";
+  const go=()=>{
+    if(!f.company.trim()){alert("Company name is required.");return;}
+    const closer=f.closer_email||(needsCloser?(closers[0]?.email||""):"");
+    if(needsCloser&&!closer){alert("Pick a closer to transfer this lead to.");return;}
+    const out={...f,company:f.company.trim(),trucks:f.trucks===""?null:parseInt(f.trucks)||0,followup:f.followup||null,closer_email:closer||null};
+    if(!needsCloser&&!lead.closer_email)delete out.closer_email;
+    onSave(out);
+  };
+  return(
+    <div className="modal-bg" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="modal" style={{maxWidth:560}}>
+        <div className="mh"><div style={{fontWeight:700,fontSize:13}}>{lead.id?"Edit Lead":"New Lead"}</div><button className="xbtn" onClick={onClose}>✕</button></div>
+        <div className="mb">
+          <div className="fg">
+            <div className="fl"><label>Carrier / Company *</label><input {...inp("company")} autoFocus/></div>
+            <div className="fl"><label>MC #</label><input {...inp("mc")}/></div>
+            <div className="fl"><label>Status</label><select {...inp("stage")}>{stages.map(s=><option key={s.id} value={s.id}>{s.l}</option>)}</select></div>
+            {needsCloser?<div className="fl"><label>Transfer to closer *</label>
+              <select value={f.closer_email||closers[0]?.email||""} onChange={e=>sf(x=>({...x,closer_email:e.target.value}))}>{closers.map(c=><option key={c.email} value={c.email}>{c.name}{c.role==="dispatcher"?" (dispatcher)":""}</option>)}</select></div>
+              :<div className="fl"><label>Next follow-up</label><input type="date" {...inp("followup")}/></div>}
+            <div className="fl"><label>Contact name</label><input {...inp("contact")}/></div>
+            <div className="fl"><label>Phone</label><input {...inp("phone")}/></div>
+            <div className="fl"><label>Email</label><input type="email" {...inp("email")}/></div>
+            <div className="fl"><label># of trucks</label><input type="number" min="0" {...inp("trucks")}/></div>
+            <div className="fl"><label>Equipment</label><select {...inp("equipment")}><option>Dry Van</option><option>Reefer</option><option>Flatbed</option><option>Step Deck</option><option>Box Truck</option><option>Other</option></select></div>
+            {needsCloser&&<div className="fl"><label>Next follow-up</label><input type="date" {...inp("followup")}/></div>}
+          </div>
+          <div className="fl" style={{marginTop:10}}><label>Notes (rates they want, lanes, objections, next steps…)</label><textarea rows={4} {...inp("notes")} style={{width:"100%",background:"var(--bg)",border:"1px solid var(--b)",borderRadius:6,color:"var(--tx)",padding:8,fontFamily:"inherit",fontSize:12}}/></div>
+          {Array.isArray(lead.history)&&lead.history.length>0&&<div style={{marginTop:12}}>
+            <div style={{fontSize:10,fontWeight:700,color:"var(--mu)",textTransform:"uppercase",letterSpacing:".5px",marginBottom:6}}>History</div>
+            {lead.history.slice().reverse().map((h,i)=><div key={i} style={{fontSize:11,color:"var(--mu)"}}>{new Date(h.at).toLocaleString("en-US")} — {h.by||"?"}: {h.from?stageOf(h.from).l+" → ":""}{stageOf(h.to).l}</div>)}
+          </div>}
+        </div>
+        <div className="mf"><button className="btn btn-s" onClick={onClose}>Cancel</button><button className="btn btn-p" disabled={busy} onClick={go}>{busy?"Saving…":lead.id?"Save":"Add Lead"}</button></div>
+      </div>
+    </div>
+  );
+}
+
+function Leaderboard({myName}){
+  const n0=new Date();
+  const ym=d=>d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0");
+  const[period,setPeriod]=useState("month");// month | year | all — same idea as the dispatcher dashboard
+  const[month,setMonth]=useState(ym(n0));
+  const[year,setYear]=useState(String(n0.getFullYear()));
+  const[who,setWho]=useState("all");// all | sdr | dispatcher
+  const[rows,setRows]=useState(null);const[err,setErr]=useState("");
+  const months=[...Array(12)].map((_,i)=>ym(new Date(n0.getFullYear(),n0.getMonth()-i,1)));
+  const years=[0,1,2].map(i=>String(n0.getFullYear()-i));
+  const mLabel=k=>{const[y,m]=k.split("-");return new Date(y,m-1,1).toLocaleString("en-US",{month:"long",year:"numeric"});};
+  React.useEffect(()=>{
+    let on=true;let from=null,to=null;
+    if(period==="month"){const[y,m]=month.split("-").map(Number);from=new Date(y,m-1,1);to=new Date(y,m,1);}
+    if(period==="year"){from=new Date(+year,0,1);to=new Date(+year+1,0,1);}
+    const body={p_from:from&&from.toISOString(),p_to:to&&to.toISOString()};
+    setRows(null);
+    const go=()=>sbApi("rpc/sdr_leaderboard",{method:"POST",body}).then(d=>{if(on){setRows(d||[]);setErr("");}}).catch(e=>on&&setErr(e.message));
+    go();const iv=setInterval(go,60000);return()=>{on=false;clearInterval(iv);};
+  },[period,month,year]);
+  const score=r=>r.closed*1000+r.transferred*100+r.interested*10+r.leads;
+  const list=(rows||[]).filter(r=>who==="all"||r.role===who).sort((a,b)=>score(b)-score(a)||(a.name||"").localeCompare(b.name||""));
+  const tot=k=>list.reduce((s,r)=>s+(r[k]||0),0);
+  const medal=i=>["🥇","🥈","🥉"][i]||"#"+(i+1);
+  const label=period==="month"?mLabel(month):period==="year"?year:"All Time";
+  const seg=(val,set,opts)=><div style={{display:"flex",gap:5,background:"var(--sf)",border:"1px solid var(--b)",borderRadius:8,padding:3}}>
+    {opts.map(([v,l])=><button key={v} onClick={()=>set(v)} style={{padding:"5px 12px",borderRadius:6,border:"none",fontSize:12,fontWeight:600,cursor:"pointer",background:val===v?"var(--card)":"transparent",color:val===v?"var(--tx)":"var(--mu)",fontFamily:"inherit"}}>{l}</button>)}
+  </div>;
+  return(<>
+    <div className="tb">
+      <div><div className="pt">🏆 SDR Leaderboard</div><div className="ps">Ranked by closed deals, then transfers, interested and qualified leads</div></div>
+      <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+        {seg(period,setPeriod,[["month","Month"],["year","Year"],["all","All Time"]])}
+        {period==="month"&&<select value={month} onChange={e=>setMonth(e.target.value)}>{months.map(k=><option key={k} value={k}>{mLabel(k)}</option>)}</select>}
+        {period==="year"&&<select value={year} onChange={e=>setYear(e.target.value)}>{years.map(y=><option key={y}>{y}</option>)}</select>}
+        {seg(who,setWho,[["all","Everyone"],["sdr","SDRs"],["dispatcher","Dispatchers"]])}
+      </div>
+    </div>
+    <div className="con">
+      {err&&<div className="al ald" style={{marginBottom:12}}>{err}</div>}
+      {!rows&&!err&&<div style={{padding:30,textAlign:"center",color:"var(--mu)"}}>Loading…</div>}
+      {rows&&<>
+        <div style={{fontSize:11,color:"var(--mu)",fontWeight:600,textTransform:"uppercase",letterSpacing:".5px",marginBottom:12}}>{label}{who!=="all"?" · "+(who==="sdr"?"SDRs":"Dispatchers"):""}</div>
+        <div className="mg">
+          <div className="mc"><div className="ml">Qualified Leads</div><div className="mv cb">{tot("leads")}</div></div>
+          <div className="mc"><div className="ml">Interested</div><div className="mv cacc">{tot("interested")}</div></div>
+          <div className="mc"><div className="ml">Transferred</div><div className="mv ca">{tot("transferred")}</div></div>
+          <div className="mc"><div className="ml">Closed</div><div className="mv cg">{tot("closed")}</div></div>
+        </div>
+        {list.filter(r=>score(r)>0).length>0&&<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:12,marginBottom:16}}>
+          {list.slice(0,3).filter(r=>score(r)>0).map((r,i)=><div key={r.name} className="card" style={{padding:14,marginBottom:0,textAlign:"center",border:r.name===myName?"1px solid var(--acc)":undefined}}>
+            <div style={{fontSize:30}}>{medal(i)}</div>
+            <div style={{fontWeight:800,fontSize:14,marginTop:4}}>{r.name}{r.name===myName?" (you)":""}</div>
+            <div style={{fontSize:11,color:"var(--mu)",marginTop:4}}><b style={{color:"var(--green)",fontSize:16}}>{r.closed}</b> closed · {r.transferred} transferred · {r.leads} qualified</div>
+          </div>)}
+        </div>}
+        {list.length===0?<div style={{padding:30,textAlign:"center",color:"var(--mu)"}}>Nobody here yet.</div>:
+        <div className="tw"><table><thead><tr><th>Rank</th><th>Name</th><th>Qualified</th><th>Interested</th><th>Transferred</th><th>Closed</th><th>Active Trucks</th></tr></thead>
+          <tbody>{list.map((r,i)=><tr key={r.name+i} style={r.name===myName?{background:"rgba(245,158,11,.08)"}:null}>
+            <td style={{fontWeight:800}}>{score(r)>0?medal(i):"—"}</td>
+            <td style={{fontWeight:700}}>{r.name}{r.name===myName?" (you)":""} <span className={"bdg "+(r.role==="sdr"?"ba":"bb")} style={{marginLeft:4}}>{r.role}</span></td>
+            <td>{r.leads}</td><td>{r.interested}</td><td>{r.transferred}</td>
+            <td style={{fontWeight:800,color:"var(--green)"}}>{r.closed}</td>
+            <td>{r.role==="sdr"?r.trucks:"—"}</td>
+          </tr>)}</tbody></table></div>}
+        <div style={{fontSize:12,color:"var(--mu)",marginTop:14,textAlign:"center"}}>Every closed carrier = a monthly commission for 12 months per truck. Who's next? 🚛</div>
+      </>}
+    </div>
+  </>);
+}
+
+// ADMIN: SDR Performance — every SDR's referred trucks, revenue, commission and lead activity.
+// "Open" shows exactly what that SDR sees in their own portal.
+function SDRPerformance({users,loads,drivers}){
+  const[sel,setSel]=useState(null);// SDR user opened in detail
+  const[leadStats,setLeadStats]=useState({});// name -> leaderboard row (all time)
+  React.useEffect(()=>{sbApi("rpc/sdr_leaderboard",{method:"POST",body:{p_from:null,p_to:null}}).then(d=>setLeadStats(Object.fromEntries((d||[]).map(r=>[r.name,r])))).catch(()=>{});},[]);
+  const nl=React.useMemo(()=>loads.map(l=>({...l,amount:Number(l.amount)||0})),[loads]);
+  if(sel)return<SDRView me={{name:sel.name,sdrTrucks:sel.sdrTrucks||[]}} loads={nl} drivers={drivers} onLogout={()=>setSel(null)} exitLabel="← All SDRs"/>;
+  const now=new Date();
+  const ymNow=now.getFullYear()+"-"+String(now.getMonth()+1).padStart(2,"0");
+  const loadDt=l=>{const d=new Date((l.dlv||l.date||l.pu||l.ts||"").slice(0,10)+"T12:00");return isNaN(d)?null:d;};
+  const ym=d=>d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0");
+  const fmt=n=>"$"+(n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  // Same rules as the SDR portal: eligible = completed & not cancelled, inside each truck's 12-month window
+  const stats=u=>{
+    let active=0,mRev=0,mCom=0,mLoads=0,tCom=0;
+    (u.sdrTrucks||[]).forEach(t=>{
+      const nm=(t.driver||"").toUpperCase();const rate=SDR_TIERS[t.fee]||0;
+      const elig=nl.filter(l=>(l.driver||"").toUpperCase()===nm&&sdrEligible(l)&&loadDt(l)).sort((a,b)=>loadDt(a)-loadDt(b));
+      const start=t.start?new Date(t.start+"T00:00"):(elig[0]?loadDt(elig[0]):null);if(!start)return;
+      const end=new Date(start.getFullYear(),start.getMonth()+SDR_MONTHS,start.getDate());
+      if(now<end)active++;
+      elig.filter(l=>{const d=loadDt(l);return d>=start&&d<end;}).forEach(l=>{
+        tCom+=l.amount*rate/100;
+        if(ym(loadDt(l))===ymNow){mRev+=l.amount;mCom+=l.amount*rate/100;mLoads++;}
+      });
+    });
+    return{trucks:(u.sdrTrucks||[]).length,active,mRev,mCom,mLoads,tCom};
+  };
+  const sdrs=users.filter(u=>u.role==="sdr").map(u=>({u,s:stats(u),ls:leadStats[u.name]||{}}));
+  const tot=k=>sdrs.reduce((a,x)=>a+(x.s[k]||0),0);
+  const monthName=now.toLocaleString("en-US",{month:"long"});
+  return(<>
+    <div className="tb"><div><div className="pt">📈 SDR Performance</div><div className="ps">Referred trucks, commission and lead activity per SDR · click an SDR to see their portal</div></div></div>
+    <div className="con">
+      <div className="mg">
+        <div className="mc"><div className="ml">SDRs</div><div className="mv cb">{sdrs.length}</div></div>
+        <div className="mc"><div className="ml">Active Trucks</div><div className="mv cacc">{tot("active")}</div></div>
+        <div className="mc"><div className="ml">{monthName} Truck Revenue</div><div className="mv">{fmt(tot("mRev"))}</div></div>
+        <div className="mc"><div className="ml">{monthName} SDR Commission</div><div className="mv cg">{fmt(tot("mCom"))}</div></div>
+      </div>
+      {sdrs.length===0?<div style={{padding:30,textAlign:"center",color:"var(--mu)"}}>No SDRs yet. Add one in Users with role “SDR (external)”.</div>:
+      <div className="tw"><table><thead><tr><th>SDR</th><th>Trucks (active)</th><th>{monthName} Loads</th><th>{monthName} Revenue</th><th>{monthName} Commission</th><th>Commission to Date</th><th>Leads (qualified / transferred / closed)</th><th></th></tr></thead>
+        <tbody>{sdrs.map(({u,s,ls})=><tr key={u.id} style={{cursor:"pointer"}} onClick={()=>setSel(u)}>
+          <td style={{fontWeight:700}}>{u.name}<div style={{fontSize:10,color:"var(--mu)"}}>{(u.sdrTrucks||[]).map(t=>t.driver+" ("+t.fee+"%)").join(", ")||"no trucks yet"}</div></td>
+          <td>{s.trucks} <span style={{color:"var(--green)"}}>({s.active} active)</span></td>
+          <td><span className="bdg bx">{s.mLoads}</span></td>
+          <td style={{color:"var(--acc)"}}>{fmt(s.mRev)}</td>
+          <td style={{fontWeight:700,color:"var(--green)"}}>{fmt(s.mCom)}</td>
+          <td style={{fontWeight:700,color:"var(--green)"}}>{fmt(s.tCom)}</td>
+          <td>{ls.leads??0} / {ls.transferred??0} / <b style={{color:"var(--green)"}}>{ls.closed??0}</b></td>
+          <td><button className="btn btn-s btn-sm">Open →</button></td>
+        </tr>)}</tbody></table></div>}
+    </div>
+  </>);
+}
+
+// SDR PORTAL — external sales rep. Data comes from the sdr_portal() database function,
+// which returns ONLY this SDR's trucks and a limited set of load fields.
+function SDRPortal({onLogout}){
+  const[tab,setTab]=useState("trucks");// trucks | leads | board
+  const[data,setData]=useState(null);const[err,setErr]=useState("");
+  React.useEffect(()=>{
+    let on=true;
+    const go=()=>fetch(SB+"/rest/v1/rpc/sdr_portal",{method:"POST",headers:SBH,body:"{}"})
+      .then(async r=>{const d=await r.json().catch(()=>({}));if(!on)return;if(r.ok){setData(d);setErr("");}else setErr(d.message||"Could not load your data");})
+      .catch(()=>on&&setErr("Offline — retrying…"));
+    go();const iv=setInterval(go,60000);
+    return()=>{on=false;clearInterval(iv);};
+  },[]);
+  const tabs=<div style={{display:"flex",gap:6,padding:"10px 16px",background:"var(--sf)",borderBottom:"1px solid var(--b)",flexWrap:"wrap",alignItems:"center"}}>
+    {[["trucks","🚛 My Trucks"],["leads","🎯 My Leads"],["board","🏆 Leaderboard"]].map(([id,l])=><button key={id} className={"btn btn-sm "+(tab===id?"btn-p":"btn-s")} onClick={()=>setTab(id)}>{l}</button>)}
+    <button className="btn btn-s btn-sm" style={{marginLeft:"auto"}} onClick={onLogout}>Sign Out</button>
+  </div>;
+  const page=c=><div style={{minHeight:"100vh",background:"var(--bg)"}}>{tabs}{c}</div>;
+  if(tab==="leads")return page(<Leads isAdmin={false} myEmail={_auth?.email}/>);
+  if(tab==="board")return page(<Leaderboard myName={data?.name}/>);
+  if(!data)return page(<div style={{padding:40,textAlign:"center",color:"var(--mu)"}}>{err||"Loading…"}</div>);
+  const loads=(data.loads||[]).map(l=>({...l,amount:Number(l.amount)||0}));
+  return page(<SDRView me={{name:data.name,sdrTrucks:data.trucks||[]}} loads={loads} drivers={data.drivers||[]} onLogout={onLogout}/>);
+}
+function SDRView({me,loads,drivers,onLogout,exitLabel}){
+  const ym=d=>d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0");
+  const now=new Date();
+  const[period,setPeriod]=useState("month");// month|year|all — same toggle as the dispatcher dashboard
+  const[month,setMonth]=useState(ym(now));
+  const[year,setYear]=useState(String(now.getFullYear()));
+  const[sel,setSel]=useState(null);// driver name of the truck opened in detail
+  const loadDt=l=>{const d=new Date((l.dlv||l.date||l.pu||l.ts||"").slice(0,10)+"T12:00");return isNaN(d)?null:d;};
+  const fmt=n=>"$"+(n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  const mLabel=k=>{const[y,m]=k.split("-");return new Date(y,m-1,1).toLocaleString("en-US",{month:"short",year:"numeric"});};
+  const d10=d=>d?d.toLocaleDateString("en-US"):"—";
+  const inPeriod=k=>period==="all"||(period==="year"?k.startsWith(year+"-"):k===month);
+  const periodLabel=period==="all"?"All Time":period==="year"?year:mLabel(month);
+  const sum=(a,f)=>a.reduce((s,x)=>s+f(x),0);
+
+  const trucks=(me.sdrTrucks||[]).map(t=>{
+    const nm=(t.driver||"").toUpperCase();
+    const drv=drivers.find(d=>(d.name||"").toUpperCase()===nm)||{};
+    const rate=SDR_TIERS[t.fee]||0;
+    const elig=loads.filter(l=>(l.driver||"").toUpperCase()===nm&&sdrEligible(l)&&loadDt(l)).sort((a,b)=>loadDt(a)-loadDt(b));
+    const start=t.start?new Date(t.start+"T00:00"):(elig[0]?loadDt(elig[0]):null);
+    const end=start?new Date(start.getFullYear(),start.getMonth()+SDR_MONTHS,start.getDate()):null;
+    const inWin=start?elig.filter(l=>{const d=loadDt(l);return d>=start&&d<end;}):[];
+    const byMonth={};
+    inWin.forEach(l=>{const k=ym(loadDt(l));if(!byMonth[k])byMonth[k]={rev:0,n:0,miles:0};byMonth[k].rev+=l.amount||0;byMonth[k].n++;byMonth[k].miles+=Number(l.miles)||0;});
+    const pLoads=inWin.filter(l=>inPeriod(ym(loadDt(l)))).sort((a,b)=>loadDt(b)-loadDt(a));
+    const pRev=sum(pLoads,l=>l.amount||0),pMiles=sum(pLoads,l=>Number(l.miles)||0);
+    const totRev=sum(inWin,l=>l.amount||0);
+    const active=!!start&&now<end;
+    const monthsLeft=active?Math.max(0,(end.getFullYear()-now.getFullYear())*12+end.getMonth()-now.getMonth()):0;
+    return{...t,drv,rate,start,end,byMonth,pLoads,pRev,pMiles,pCom:pRev*rate/100,totRev,totCom:totRev*rate/100,active,monthsLeft};
+  });
+  const pRev=sum(trucks,t=>t.pRev),pCom=sum(trucks,t=>t.pCom),totCom=sum(trucks,t=>t.totCom);
+  const allMonths=[...new Set([ym(now),...trucks.flatMap(t=>Object.keys(t.byMonth))])].sort().reverse();
+  const allYears=[...new Set(allMonths.map(k=>k.slice(0,4)))].sort().reverse();
+  const status=t=>t.active?["bg","Active · "+t.monthsLeft+" mo left"]:t.start?["br","Period ended"]:["bx","Awaiting first load"];
+  const route=l=>(l.pickup||"").split(",").slice(0,2).join(",")+" → "+(l.delivery||"").split(",").slice(0,2).join(",");
+  const cur=sel&&trucks.find(t=>t.driver===sel);
+
+  const Toggle=(
+    <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+      <div style={{display:"flex",gap:5,background:"var(--sf)",border:"1px solid var(--b)",borderRadius:8,padding:3}}>
+        {["month","year","all"].map(p=>(
+          <button key={p} onClick={()=>setPeriod(p)} style={{padding:"5px 12px",borderRadius:6,border:"none",fontSize:12,fontWeight:600,cursor:"pointer",background:period===p?"var(--card)":"transparent",color:period===p?"var(--tx)":"var(--mu)",fontFamily:"inherit"}}>
+            {p==="month"?"Month":p==="year"?"Year":"All Time"}
+          </button>
+        ))}
+      </div>
+      {period==="month"&&<select value={month} onChange={e=>setMonth(e.target.value)}>{allMonths.map(k=><option key={k} value={k}>{mLabel(k)}</option>)}</select>}
+      {period==="year"&&<select value={year} onChange={e=>setYear(e.target.value)}>{allYears.map(y=><option key={y} value={y}>{y}</option>)}</select>}
+      <button className="btn btn-s" onClick={onLogout}>{exitLabel||"Sign Out"}</button>
+    </div>
+  );
+  const header=(title,sub)=>(
+    <div className="tb"><div><div className="pt">{title}</div><div className="ps">{sub}</div></div>{Toggle}</div>
+  );
+  const Info=({l,v,c})=><div className="mc" style={{padding:"10px 14px"}}><div className="ml">{l}</div><div style={{fontWeight:700,fontSize:14,color:c||"var(--tx)"}}>{v}</div></div>;
+
+  // ── Truck detail page
+  if(cur){const[sc,st]=status(cur);const months=Object.keys(cur.byMonth).filter(inPeriod).sort().reverse();return(
+    <div style={{minHeight:"100vh",background:"var(--bg)"}}>
+      {header("🚛 "+cur.driver+(cur.drv.truck?" · Truck "+cur.drv.truck:""),<>{me.name} · <span className="sb-role r-sdr">SDR</span></>)}
+      <div className="con">
+        <button className="btn btn-s btn-sm" style={{marginBottom:14}} onClick={()=>setSel(null)}>← All trucks</button>
+        <div className="sh"><div className="st">Truck Info</div></div>
+        <div className="mg">
+          <Info l="Driver" v={cur.driver}/>
+          <Info l="Truck #" v={cur.drv.truck||"—"}/>
+          <Info l="Trailer" v={cur.drv.trailer||"—"}/>
+          <Info l="Carrier" v={cur.drv.carrier||"—"}/>
+          <Info l="Dispatch Fee" v={cur.fee+"%"}/>
+          <Info l="Your Rate" v={cur.rate+"% of revenue"} c="var(--amb)"/>
+          <Info l="Commission Period" v={d10(cur.start)+" → "+d10(cur.end)}/>
+          <Info l="Status" v={<span className={"bdg "+sc}>{st}</span>}/>
+        </div>
+        <div className="sh"><div className="st">{periodLabel}</div></div>
+        <div className="mg">
+          <div className="mc"><div className="ml">Loads</div><div className="mv cb">{cur.pLoads.length}</div></div>
+          <div className="mc"><div className="ml">Eligible Revenue</div><div className="mv cacc">{fmt(cur.pRev)}</div></div>
+          <div className="mc"><div className="ml">Miles</div><div className="mv">{cur.pMiles.toLocaleString()}</div></div>
+          <div className="mc"><div className="ml">Avg $/Mile</div><div className="mv">{cur.pMiles?"$"+(cur.pRev/cur.pMiles).toFixed(2):"—"}</div></div>
+          <div className="mc"><div className="ml">Your Commission</div><div className="mv cg">{fmt(cur.pCom)}</div></div>
+        </div>
+        {months.length>0&&<>
+          <div className="sh"><div className="st">By Month</div></div>
+          <div className="tw" style={{marginBottom:14}}><table><thead><tr><th>Month</th><th>Loads</th><th>Miles</th><th>Eligible Revenue</th><th>Rate</th><th>Commission</th></tr></thead>
+            <tbody>{months.map(k=>{const b=cur.byMonth[k];return<tr key={k}>
+              <td style={{fontWeight:600}}>{mLabel(k)}</td><td><span className="bdg bx">{b.n}</span></td><td>{b.miles.toLocaleString()}</td>
+              <td style={{color:"var(--green)"}}>{fmt(b.rev)}</td><td>{cur.rate}%</td>
+              <td style={{fontWeight:700,color:"var(--green)"}}>{fmt(b.rev*cur.rate/100)}</td></tr>;})}
+            <tr><td style={{fontWeight:800}}>Total</td><td>{cur.pLoads.length}</td><td>{cur.pMiles.toLocaleString()}</td><td style={{fontWeight:700}}>{fmt(cur.pRev)}</td><td></td><td style={{fontWeight:800,color:"var(--green)"}}>{fmt(cur.pCom)}</td></tr>
+            </tbody></table></div>
+        </>}
+        <div className="sh"><div className="st">Loads — {periodLabel}</div></div>
+        {cur.pLoads.length===0?<div style={{textAlign:"center",padding:30,color:"var(--mu)"}}>No completed loads in this period</div>:
+        <div className="tw"><table><thead><tr><th>Delivered</th><th>Route</th><th>Miles</th><th>$/Mile</th><th>Revenue</th><th>Your Commission</th></tr></thead>
+          <tbody>{cur.pLoads.map(l=>{const mi=Number(l.miles)||0;return<tr key={l.id}>
+            <td>{d10(loadDt(l))}</td><td style={{fontSize:11}}>{route(l)}</td><td>{mi||"—"}</td>
+            <td>{mi?"$"+((l.amount||0)/mi).toFixed(2):"—"}</td>
+            <td style={{color:"var(--green)"}}>{fmt(l.amount)}</td>
+            <td style={{fontWeight:700,color:"var(--green)"}}>{fmt((l.amount||0)*cur.rate/100)}</td></tr>;})}</tbody></table></div>}
+        <div style={{fontSize:10,color:"var(--mu)",marginTop:10}}>Only completed, non-cancelled loads inside this truck's 12-month commission period are counted.</div>
+      </div>
+    </div>);}
+
+  // ── Overview: all referred trucks
+  return(
+    <div style={{minHeight:"100vh",background:"var(--bg)"}}>
+      {header("⚓ Vessel Solutions — SDR Portal",<>{me.name} · <span className="sb-role r-sdr">SDR</span></>)}
+      <div className="con">
+        <div style={{fontSize:11,color:"var(--mu)",fontWeight:600,textTransform:"uppercase",letterSpacing:".5px",marginBottom:12}}>{periodLabel}</div>
+        <div className="mg">
+          <div className="mc"><div className="ml">Referred Trucks</div><div className="mv cb">{trucks.length}</div></div>
+          <div className="mc"><div className="ml">{periodLabel} Eligible Revenue</div><div className="mv cacc">{fmt(pRev)}</div></div>
+          <div className="mc"><div className="ml">{periodLabel} Commission</div><div className="mv cg">{fmt(pCom)}</div></div>
+          <div className="mc"><div className="ml">Total Commission to Date</div><div className="mv cg">{fmt(totCom)}</div></div>
+        </div>
+        {trucks.length===0&&<div style={{textAlign:"center",padding:40,color:"var(--mu)"}}>No trucks assigned yet. Contact Vessel Solutions.</div>}
+        {trucks.map(t=>{const[sc,st]=status(t);return(
+          <div key={t.driver} className="card" onClick={()=>setSel(t.driver)} style={{marginBottom:12,padding:16,cursor:"pointer"}}>
+            <div style={{display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginBottom:10}}>
+              <div>
+                <div style={{fontWeight:800,fontSize:15}}>{t.driver}{t.drv.truck?<span style={{color:"var(--mu)",fontWeight:400,fontSize:12}}> · Truck {t.drv.truck}</span>:null}</div>
+                <div style={{fontSize:11,color:"var(--mu)"}}>{t.drv.carrier||""}</div>
+              </div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+                <span className="bdg bx">Dispatch fee {t.fee}%</span>
+                <span className="bdg ba">Your rate {t.rate}%</span>
+                <span className={"bdg "+sc}>{st}</span>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:18,flexWrap:"wrap",alignItems:"center",fontSize:12}}>
+              <div><span style={{color:"var(--mu)"}}>Loads </span><b>{t.pLoads.length}</b></div>
+              <div><span style={{color:"var(--mu)"}}>Revenue </span><b style={{color:"var(--acc)"}}>{fmt(t.pRev)}</b></div>
+              <div><span style={{color:"var(--mu)"}}>Commission </span><b style={{color:"var(--green)"}}>{fmt(t.pCom)}</b></div>
+              <div><span style={{color:"var(--mu)"}}>To date </span><b style={{color:"var(--green)"}}>{fmt(t.totCom)}</b></div>
+              <span className="btn btn-s btn-sm" style={{marginLeft:"auto"}}>Open truck →</span>
+            </div>
+          </div>);})}
+        <div style={{fontSize:10,color:"var(--mu)",marginTop:10}}>Eligible revenue = completed loads dispatched by Vessel Solutions for your referred trucks, excluding cancelled loads. Commission is calculated and paid at the end of each month. Figures are for tracking only and are subject to final monthly statement.</div>
+      </div>
+    </div>
+  );
+}
+
 // CHAT
 function Chat({ctx}){
   const{chats,setChats,sess,users}=ctx;
@@ -3226,7 +4022,7 @@ function Chat({ctx}){
         <div ref={ref}/>
       </div>
       <div className="cin">
-        <select style={{width:110,background:"var(--sf)",border:"1px solid var(--b)",color:"var(--tx)",borderRadius:6,padding:"6px 8px",fontSize:12,fontFamily:"inherit"}} value={to} onChange={e=>st(e.target.value)}><option value="ALL">→ ALL</option>{users.filter(u=>u.name!==sess.name).map(u=><option key={u.id} value={u.name}>{u.name}</option>)}</select>
+        <select style={{width:110,background:"var(--sf)",border:"1px solid var(--b)",color:"var(--tx)",borderRadius:6,padding:"6px 8px",fontSize:12,fontFamily:"inherit"}} value={to} onChange={e=>st(e.target.value)}><option value="ALL">→ ALL</option>{users.filter(u=>u.name!==sess.name&&u.role!=="sdr").map(u=><option key={u.id} value={u.name}>{u.name}</option>)}</select>
         <input style={{flex:1}} placeholder="Type message..." value={msg} onChange={e=>sm(e.target.value)} onKeyDown={e=>e.key==="Enter"&&send()}/>
         <button className="btn btn-p" onClick={send}>Send</button>
       </div>
