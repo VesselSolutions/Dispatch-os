@@ -192,6 +192,15 @@ function genPassword(){const a=new Uint8Array(9);crypto.getRandomValues(a);retur
 // (e.g. "vinny" -> vinny@vesselsolutions.io). The contact email on the profile is separate.
 const loginEmail=u=>(u.u?u.u+"@vesselsolutions.io":"").trim().toLowerCase();
 function dbGet(k){return fetch(SB+"/rest/v1/kv_store?key=eq."+k+"&select=value",{headers:SBH}).then(r=>r.json()).then(d=>d&&d[0]?d[0].value:undefined).catch(()=>undefined);}
+// Deleted loads ("tombstones"). Without this, the anti-overwrite guard below, or another computer with an
+// older copy, would bring a deleted load back. Every save and every read drops these load IDs. The list only grows.
+let _delLoads=new Set();
+function refreshDelLoads(){return dbGet("vs4_l_del").then(a=>{if(Array.isArray(a))_delLoads=new Set([...a,..._delLoads]);}).catch(()=>{});}
+function markLoadsDeleted(ids){
+  ids.forEach(id=>_delLoads.add(id));
+  return dbGet("vs4_l_del").then(cur=>{const all=[...new Set([...(Array.isArray(cur)?cur:[]),..._delLoads])];_delLoads=new Set(all);_dbSetRaw("vs4_l_del",all);});
+}
+refreshDelLoads();setInterval(refreshDelLoads,5000);
 function dbSet(k,v){
   // SAFETY GUARD: never write empty/tiny arrays for critical keys
   const CRITICAL_MIN={"vs4_d":1,"vs4_c":1,"vs4_l":1,"vs4_u":1};
@@ -203,8 +212,9 @@ function dbSet(k,v){
   }
   // ANTI-OVERWRITE GUARD for loads: if server has more loads than we do, merge instead of replace
   if(k==="vs4_l"&&Array.isArray(v)){
-    dbGet(k).then(serverVal=>{
-      const serverArr=Array.isArray(serverVal)?serverVal:[];
+    Promise.all([dbGet(k),refreshDelLoads()]).then(([serverVal])=>{
+      v=v.filter(l=>!_delLoads.has(l.id));// never write back a deleted load
+      const serverArr=(Array.isArray(serverVal)?serverVal:[]).filter(l=>!_delLoads.has(l.id));
       if(serverArr.length>v.length){
         // Server has more loads — merge: keep all server loads, update ones we have changes for
         const localMap=new Map(v.map(l=>[l.id,l]));
@@ -321,6 +331,7 @@ function useLS(k,d){
       return data.map(u=>(u.id===1||u.id===2)?{...u,pct:0,role:"admin"}:u);
     }
     if(k==="vs4_l"&&Array.isArray(data)){
+      data=data.filter(l=>!_delLoads.has(l.id));// hide loads that were deleted on any computer
       // Only fetch docs for loads that don't have them locally, once per session
       if(!window._docFetchCache)window._docFetchCache={};
       const need=data.filter(l=>{
@@ -897,7 +908,7 @@ function LoadBoard({ctx,setTab,Mob}){
   const hasFilters=q||dateFrom||dateTo||drvF||factF!=="All"||pickupF||deliveryF||fs!=="All";
   const clearAll=()=>{sq("");setDF("");setDT2("");sdrF("");sfactF("All");setPF("");setDelF("");sfs("All");};
   const upd=(id,k,v)=>ctx.setLoads(loads.map(l=>l.id===id?{...l,[k]:v}:l));
-  const del=(id)=>{if(window.confirm("Delete load?"))ctx.setLoads(loads.filter(l=>l.id!==id))};
+  const del=(id)=>{if(window.confirm("Delete load?")){markLoadsDeleted([id]);ctx.setLoads(loads.filter(l=>l.id!==id));}};
   const saveFile=(id,field,data)=>ctx.setLoads(loads.map(l=>l.id===id?{...l,[field]:data}:l));
   return(<>
     <div className="tb">
