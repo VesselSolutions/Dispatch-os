@@ -141,12 +141,38 @@ async function authToken(grant,body){
   if(!r.ok)throw new Error(d.error_description||d.msg||"Invalid email or password");
   return{access_token:d.access_token,refresh_token:d.refresh_token,expires_at:Date.now()+d.expires_in*1000,email:(d.user?.email||"").toLowerCase()};
 }
-async function refreshAuth(){
-  if(!_auth)return;
-  try{setAuth(await authToken("refresh_token",{refresh_token:_auth.refresh_token}));}
-  catch(e){console.warn("Session expired:",e.message);setAuth(null);}
+// Renew the login before it expires (tokens last 1 hour). One renewal at a time.
+// If renewal is impossible (e.g. signed out elsewhere), go back to the login screen instead of failing silently.
+let _refreshing=null;
+function refreshAuth(){
+  if(!_auth)return Promise.resolve();
+  if(_refreshing)return _refreshing;
+  _refreshing=authToken("refresh_token",{refresh_token:_auth.refresh_token})
+    .then(a=>setAuth(a))
+    .catch(e=>{console.warn("Session expired:",e.message);setAuth(null);try{sessionStorage.removeItem("vs_s");}catch{}alert("Your session expired. Please sign in again.");location.reload();})
+    .finally(()=>{_refreshing=null;});
+  return _refreshing;
 }
-setInterval(()=>{if(_auth&&_auth.expires_at-Date.now()<5*60*1000)refreshAuth();},60000);
+const _needsRefresh=()=>_auth&&_auth.expires_at-Date.now()<5*60*1000;
+setInterval(()=>{if(_needsRefresh())refreshAuth();},30000);
+// Browsers pause timers in background tabs / sleeping laptops: renew as soon as the tab is used again
+document.addEventListener("visibilitychange",()=>{if(!document.hidden&&_needsRefresh())refreshAuth();});
+window.addEventListener("focus",()=>{if(_needsRefresh())refreshAuth();});
+// Safety net: if any database/storage request is rejected because the login expired, renew it and retry once
+{
+  const _f=window.fetch.bind(window);
+  window.fetch=async(url,opt={})=>{
+    const isSB=typeof url==="string"&&url.startsWith(SB)&&!url.includes("/auth/v1/");
+    if(isSB&&_needsRefresh())await refreshAuth();
+    const withTok=o=>{const h={...(o.headers||{})};if(_auth&&h.Authorization&&h.Authorization!=="Bearer "+SK)h.Authorization="Bearer "+_auth.access_token;return{...o,headers:h};};
+    let r=await _f(url,isSB?withTok(opt):opt);
+    if(isSB&&_auth&&(r.status===401||(r.status===400&&url.includes("/storage/")&&/jwt|exp/i.test(await r.clone().text().catch(()=>""))))){
+      await refreshAuth();
+      if(_auth)r=await _f(url,withTok(opt));
+    }
+    return r;
+  };
+}
 // Admin-only helpers (the database rejects them for anyone else)
 async function sbSignup(email,password){
   const r=await fetch(SB+"/auth/v1/signup",{method:"POST",headers:{apikey:SK,"Content-Type":"application/json"},body:JSON.stringify({email,password})});
