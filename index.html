@@ -447,6 +447,8 @@ function syncPodUrls(loadId,urls){
   const storageUrls=urls.filter(u=>u&&u.startsWith("http"));
   try{const key="vs4_du_"+loadId;const ex=JSON.parse(localStorage.getItem(key)||"{}");ex.pods=storageUrls;localStorage.setItem(key,JSON.stringify(ex));dbSet(key,ex);}catch{}
 }function nowTS(){const n=new Date();return n.getFullYear()+"-"+String(n.getMonth()+1).padStart(2,"0")+"-"+String(n.getDate()).padStart(2,"0")+" "+String(n.getHours()).padStart(2,"0")+":"+String(n.getMinutes()).padStart(2,"0")}
+// Total miles = loaded + deadhead. Used for the Load Board Miles column and every RPM.
+const totMiles=l=>(parseFloat(l.miles)||0)+(parseFloat(l.dh)||0);
 const STATUSES=["Pending","In Transit","Delivered","Cancelled"];
 const PO_ST=["Pending","Driver Picked Up","Driver Delivered","Delivered","Cancelled"];
 const COMPANY={name:"Vessel Solutions",url:"vesselsolutions.io",factEmail:"Cashapp@rtsfinancial.com"};
@@ -929,12 +931,12 @@ function LoadBoard({ctx,setTab,Mob}){
     <div className="con">
       {openL&&<div id="ld-panel"><LoadDetail load={loads.find(l=>String(l.id)===String(openL))} onClose={()=>setOL(null)} onUpdate={(id,d)=>ctx.setLoads(loads.map(l=>l.id===id?{...l,...d}:l))} onFile={saveFile}/></div>}
       <div className="tw"><table><thead><tr>
-        <th>Load #</th><th>Carrier</th><th>Driver</th><th>Broker</th><th>MC</th><th>Pickup</th><th>Delivery</th><th>PU Date</th><th>DLV Date</th><th>Amount</th><th>RPM</th><th>Miles</th><th>Type</th><th>Factor</th><th>POD</th><th>Status</th><th style={{color:"var(--mu)",fontSize:9}}>SUBMITTED</th><th>Notes</th>
+        <th>Load #</th><th>Carrier</th><th>Driver</th><th>Broker</th><th>MC</th><th>Pickup</th><th>Delivery</th><th>PU Date</th><th>DLV Date</th><th>Amount</th><th title="Amount ÷ (loaded + deadhead miles)">RPM (incl. DH)</th><th title="Loaded + deadhead miles">Miles (incl. DH)</th><th>Type</th><th>Factor</th><th>POD</th><th>Status</th><th style={{color:"var(--mu)",fontSize:9}}>SUBMITTED</th><th>Notes</th>
         {isAdmin&&<th>Disp.</th>}<th></th>
       </tr></thead><tbody>
         {fl.length===0&&<tr><td colSpan={15} style={{textAlign:"center",padding:28,color:"var(--mu)"}}>No loads found</td></tr>}
         {fl.map(l=>{
-          const rpm=l.miles&&l.amount?(l.amount/l.miles).toFixed(2):null;
+          const tm=totMiles(l);const rpm=tm&&l.amount?(l.amount/tm).toFixed(2):null;// RPM includes deadhead
           const rpmOk=rpm&&parseFloat(rpm)>=(l.loadType==="Reefer"?3:2);
           const podWarn=hasPod(l)&&l.factoring!=="YES";
           const sts=l.loadType==="Power Only"?PO_ST:STATUSES;
@@ -950,7 +952,7 @@ function LoadBoard({ctx,setTab,Mob}){
             <td style={{fontSize:11}}>{l.dlv}{l.dlvTime&&<div style={{fontSize:9,color:"var(--mu)"}}>{l.dlvTime}</div>}</td>
             <td style={{color:"var(--green)",fontWeight:700}}>${l.amount?.toLocaleString()}</td>
             <td style={{color:rpm?(rpmOk?"var(--green)":"var(--red)"):"var(--mu)",fontWeight:600,fontSize:11}}>{rpm?"$"+rpm:"—"}</td>
-            <td style={{fontSize:11,color:"var(--mu)"}}>{l.miles||"—"}</td>
+            <td style={{fontSize:11,color:"var(--mu)"}}>{tm?tm.toLocaleString():"—"}{parseFloat(l.dh)>0&&<div style={{fontSize:9,opacity:.75}}>{(parseFloat(l.miles)||0).toLocaleString()} + {parseFloat(l.dh).toLocaleString()} DH</div>}</td>
             <td><span className={"bdg "+(l.loadType==="Power Only"?"bp":l.loadType==="Reefer"?"bb":"bx")} style={{fontSize:9}}>{(l.loadType||"Van").split(" ")[0]}</span></td>
             <td><span className={"bdg "+(l.factoring==="YES"?"bg":"br")}>{l.factoring}</span></td>
             <td>{podWarn?<span className="bdg br" style={{fontSize:9,cursor:"help"}} title="POD uploaded — needs factoring!">⚠️ POD!</span>:hasPod(l)?<span className="bdg bg" style={{fontSize:9}}>✓{getPodList(l).length>1?" "+getPodList(l).length+"pg":"POD"}</span>:<span className="bdg bx" style={{fontSize:9}}>—</span>}</td>
@@ -3284,7 +3286,7 @@ function Performance({ctx}){
     const d=l.driver||"?";if(!bD[d])bD[d]={n:0,rev:0};bD[d].n++;bD[d].rev+=l.amount||0;
     const c=l.carrier||"?";if(!bC[c])bC[c]={n:0,rev:0};bC[c].n++;bC[c].rev+=l.amount||0;
     const ds=l.dispatcher||"?";if(!bDsp[ds])bDsp[ds]={n:0,rev:0,loads:[]};bDsp[ds].n++;bDsp[ds].rev+=l.amount||0;bDsp[ds].loads.push(l);
-    if(l.pickup&&l.delivery){const r=(l.pickup.split(",")[0].trim())+" → "+(l.delivery.split(",")[0].trim());if(!bRoute[r])bRoute[r]={n:0,rev:0,rpm:[]};bRoute[r].n++;bRoute[r].rev+=l.amount||0;if(l.miles&&l.amount)bRoute[r].rpm.push((l.amount/l.miles));}
+    if(l.pickup&&l.delivery){const r=(l.pickup.split(",")[0].trim())+" → "+(l.delivery.split(",")[0].trim());if(!bRoute[r])bRoute[r]={n:0,rev:0,rpm:[]};bRoute[r].n++;bRoute[r].rev+=l.amount||0;if(totMiles(l)&&l.amount)bRoute[r].rpm.push((l.amount/totMiles(l)));}
   });
   const tot=filtered.reduce((s,l)=>s+(l.amount||0),0);
   const sort=o=>Object.entries(o).sort((a,b)=>b[1].rev-a[1].rev);
