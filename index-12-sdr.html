@@ -536,6 +536,7 @@ function App(){
   if(!sess||!_auth)return<Login onLogin={login}/>;
   // SDR: external user — gets only their own trucks from the server, never the full database
   if(sess.role==="sdr")return<SDRPortal onLogout={logout}/>;
+  if(sess.role==="carrier")return<CarrierPortal onLogout={logout}/>;
   return<MainApp sess={sess} setSess={setSess} logout={logout}/>;
 }
 
@@ -2213,7 +2214,11 @@ function Invoices({ctx}){
   };
 
   const InvTable=({list,showSubmit,showReturn})=>(
-    <div className="tw"><table><thead><tr><th>Invoice #</th><th>Carrier(s)</th><th>Loads</th><th>Load Total</th><th>Fee</th><th>Date</th>{showSubmit&&<th>Submitted</th>}{showReturn&&<th>Returned</th>}<th>Received</th><th></th></tr></thead>
+    (mob?<div>{inv.map(i=><div key={i.num} className="card" style={{padding:12,marginBottom:10}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}><b style={{fontFamily:"monospace"}}>{i.num}</b><span className={"bdg "+(i.paid?"bg":"ba")}>{i.paid?"Paid":"Open"}</span></div>
+          <div style={{fontSize:11,color:"var(--mu)"}}>{i.date}{i.shared?" · your share of a combined invoice":""}</div>
+          {cgrid(<>{kv("Loads",i.loads)}{kv("Load total",fmt0(Number(i.loadTotal)||0))}{kv("Fee "+i.pct+"%",fmt(Number(i.amount)||0),"var(--amb)")}</>)}
+        </div>)}</div>:<div className="tw"><table><thead><tr><th>Invoice #</th><th>Carrier(s)</th><th>Loads</th><th>Load Total</th><th>Fee</th><th>Date</th>{showSubmit&&<th>Submitted</th>}{showReturn&&<th>Returned</th>}<th>Received</th><th></th></tr></thead>
     <tbody>{list.length===0&&<tr><td colSpan={10} style={{textAlign:"center",padding:20,color:"var(--mu)"}}>None yet</td></tr>}
     {list.map(i=>(
       <tr key={i.id}>
@@ -2240,7 +2245,7 @@ function Invoices({ctx}){
           </div>
         </td>
       </tr>
-    ))}</tbody></table></div>
+    ))}</tbody></table></div>)
   );
 
   return(<>
@@ -2706,7 +2711,7 @@ function Drivers({ctx}){
 
 // USERS
 function Users({ctx}){
-  const{users,setUsers,loads,setLoads,sess,drivers}=ctx;
+  const{users,setUsers,loads,setLoads,sess,drivers,carriers}=ctx;
   const[modal,sm]=useState(false);const[editU,seu]=useState(null);const[f,sf]=useState({u:"",pw:"",name:"",email:"",role:"dispatcher",pct:3,permDrv:[],tempDrv:[]});
   const[busy,setBusy]=useState(false);
   // Closers: who can receive leads to close (admin-managed list in the database)
@@ -2718,7 +2723,7 @@ function Users({ctx}){
   React.useEffect(()=>{loadAccess();loadClosers();},[]);
   const allDrvs=[...new Set(drivers.map(d=>d.name))];
   const open=(u)=>{sf(u?{...u,pw:"",_closer:closerSet.has(loginEmail(u))}:{u:"",pw:genPassword(),name:"",email:"",role:"dispatcher",pct:3,permDrv:[],tempDrv:[]});seu(u||null);sm(true)};
-  const accessRow=u=>({email:loginEmail(u),role:u.role,name:u.name,sdr_trucks:u.role==="sdr"?(u.sdrTrucks||[]):[]});
+  const accessRow=u=>({email:loginEmail(u),role:u.role,name:u.name,sdr_trucks:u.role==="sdr"?(u.sdrTrucks||[]):[],carrier_name:u.role==="carrier"?(u.carrierName||null):null});
   // Create the Supabase login + grant access. Password is never stored in the app.
   const createLogin=async(u,pw)=>{
     const email=loginEmail(u);
@@ -2762,11 +2767,12 @@ function Users({ctx}){
   };
   const save=async()=>{
     if(!f.u||!f.name){alert("Username and name required.");return;}
+    if(f.role==="carrier"&&!f.carrierName){alert("Pick which carrier company this login belongs to.");return;}
     if(!editU&&(!f.pw||f.pw.length<8)){alert("Password must be at least 8 characters.");return;}
     if(!editU&&users.find(x=>x.u===f.u)){alert("Username taken.");return;}
-    const newPct=f.role==="sdr"?0:(f.pct===""||f.pct===null||f.pct===undefined?3:parseFloat(f.pct));
+    const newPct=(f.role==="sdr"||f.role==="carrier")?0:(f.pct===""||f.pct===null||f.pct===undefined?3:parseFloat(f.pct));
     const{pw,_closer,...fx}=f;// password is only sent to Supabase Auth, never saved in the users list
-    const ff={...fx,email:(fx.email||"").trim(),...(fx.role==="sdr"?{permDrv:[],tempDrv:[]}:{sdrTrucks:undefined})};
+    const ff={...fx,email:(fx.email||"").trim(),...(fx.role==="sdr"?{permDrv:[],tempDrv:[],carrierName:undefined}:fx.role==="carrier"?{permDrv:[],tempDrv:[],sdrTrucks:undefined}:{sdrTrucks:undefined,carrierName:undefined})};
     setBusy(true);
     try{
       if(editU){
@@ -2824,6 +2830,7 @@ function Users({ctx}){
   const togD=(type,nm)=>{const a=f[type]||[];sf(x=>({...x,[type]:a.includes(nm)?a.filter(d=>d!==nm):[...a,nm]}))};
   // SDR trucks: [{driver, fee (4|5|6), start (optional YYYY-MM-DD override of first completed load)}]
   const isSdrForm=f.role==="sdr";
+  const isCarrierForm=f.role==="carrier";
   const sdrT=f.sdrTrucks||[];
   const togSdr=nm=>sf(x=>{const a=x.sdrTrucks||[];return{...x,sdrTrucks:a.find(t=>t.driver===nm)?a.filter(t=>t.driver!==nm):[...a,{driver:nm,fee:5,start:""}]};});
   const updSdr=(nm,k,v)=>sf(x=>({...x,sdrTrucks:(x.sdrTrucks||[]).map(t=>t.driver===nm?{...t,[k]:v}:t)}));
@@ -2836,13 +2843,13 @@ function Users({ctx}){
       <tbody>{users.map(u=>{const s=stats(u.name);return(
         <tr key={u.id}>
           <td style={{fontWeight:700}}>{u.name}{closerSet.has(loginEmail(u))&&<span className="bdg bg" style={{marginLeft:6}} title="Can close leads">🤝 closer</span>}</td><td style={{fontFamily:"monospace",fontSize:11,color:"var(--mu)"}}>{u.u}</td>
-          <td><span className={"bdg "+(u.role==="admin"?"bp":u.role==="sdr"?"ba":"bb")}>{u.role}</span></td>
-          <td style={{fontWeight:700,color:"var(--acc)"}}>{u.role==="sdr"?<span style={{color:"var(--mu)"}}>—</span>:(u.id===1||u.id===2)?<span style={{color:"var(--green)"}}>0%</span>:(u.pct||3)+"%"}</td>
+          <td><span className={"bdg "+(u.role==="admin"?"bp":(u.role==="sdr"||u.role==="carrier")?"ba":"bb")}>{u.role}</span></td>
+          <td style={{fontWeight:700,color:"var(--acc)"}}>{(u.role==="sdr"||u.role==="carrier")?<span style={{color:"var(--mu)"}}>—</span>:(u.id===1||u.id===2)?<span style={{color:"var(--green)"}}>0%</span>:(u.pct||3)+"%"}</td>
           <td style={{fontSize:11,color:"var(--mu)"}}>{u.email||"—"}</td>
           <td>{(()=>{const a=access[loginEmail(u)];
             if(!a)return<button className="btn btn-p btn-sm" disabled={busy} onClick={()=>activate(u)}>🔐 Create login</button>;
             return<div style={{display:"flex",gap:5,alignItems:"center"}}><span className={"bdg "+(a.role===u.role?"bg":"ba")} title={a.role!==u.role?"Server role differs — click Edit → Save to sync":""}>✓ {a.role}</span>{u.id!==sess.id&&<button className="btn btn-s btn-sm" onClick={()=>revoke(u)} title="Revoke login">⛔</button>}</div>;})()}</td>
-          <td style={{fontSize:11}}>{u.role==="sdr"?((u.sdrTrucks||[]).map(t=>t.driver+" ("+t.fee+"%)").join(", ")||<span style={{color:"var(--mu)"}}>no trucks</span>):((u.permDrv||[]).join(", ")||<span style={{color:"var(--mu)"}}>—</span>)}</td>
+          <td style={{fontSize:11}}>{u.role==="carrier"?<span>🏢 {u.carrierName||"no carrier set"}</span>:u.role==="sdr"?((u.sdrTrucks||[]).map(t=>t.driver+" ("+t.fee+"%)").join(", ")||<span style={{color:"var(--mu)"}}>no trucks</span>):((u.permDrv||[]).join(", ")||<span style={{color:"var(--mu)"}}>—</span>)}</td>
           <td><span className="bdg bx">{s.n}</span></td><td style={{color:"var(--green)",fontWeight:600}}>${s.rev.toLocaleString()}</td>
           <td><div style={{display:"flex",gap:5}}><button className="btn btn-s btn-sm" onClick={()=>open(u)}>Edit</button>{u.id!==sess.id&&<button className="btn btn-d btn-sm" onClick={()=>del(u.id)}>✕</button>}</div></td>
         </tr>);})}</tbody></table></div>
@@ -2852,18 +2859,23 @@ function Users({ctx}){
           <div className="mb">
             <div className="fg" style={{marginBottom:14}}>
               <div className="fl"><label>Full Name *</label><input value={f.name} onChange={e=>sf(x=>({...x,name:e.target.value}))}/></div>
-              <div className="fl"><label>Role</label><select value={f.role} onChange={e=>sf(x=>({...x,role:e.target.value}))}><option value="dispatcher">Dispatcher</option><option value="admin">Admin</option><option value="sdr">SDR (external)</option></select></div>
+              <div className="fl"><label>Role</label><select value={f.role} onChange={e=>sf(x=>({...x,role:e.target.value}))}><option value="dispatcher">Dispatcher</option><option value="admin">Admin</option><option value="sdr">SDR (external)</option><option value="carrier">Carrier (external)</option></select></div>
               <div className="fl"><label>Username * (used to log in)</label><input value={f.u} disabled={!!editU} onChange={e=>sf(x=>({...x,u:e.target.value.toLowerCase().replace(/[^a-z0-9._-]/g,"")}))}/></div>
               {!editU&&<div className="fl"><label>Password * (min 8 — not stored in the app)</label><input value={f.pw} onChange={e=>sf(x=>({...x,pw:e.target.value}))}/></div>}
               <div className="fl"><label>Email (contact, optional)</label><input type="email" value={f.email} onChange={e=>sf(x=>({...x,email:e.target.value}))}/></div>
               {editU&&<div className="fl" style={{fontSize:11,color:"var(--mu)",alignSelf:"end"}}>To reset a password: Supabase → Authentication → Users.</div>}
-              {!isSdrForm&&<div className="fl"><label>Current Fee %</label>
+              {!isSdrForm&&!isCarrierForm&&<div className="fl"><label>Current Fee %</label>
               <div style={{display:"flex",gap:8,alignItems:"center"}}>
                 <input type="number" step="0.1" value={f.pct} onChange={e=>sf(x=>({...x,pct:e.target.value}))} style={{width:80}}/>
                 {editU&&<div style={{fontSize:11,color:"var(--mu)"}}>Change → new loads use new %</div>}
               </div></div>}
             </div>
-            {!isSdrForm&&<label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,margin:"0 0 14px",cursor:"pointer"}}><input type="checkbox" checked={!!f._closer} onChange={e=>sf(x=>({...x,_closer:e.target.checked}))}/> 🤝 <b>Can close leads</b> <span style={{color:"var(--mu)"}}>(appears in “Transfer to Closer”)</span></label>}
+            {!isSdrForm&&!isCarrierForm&&<label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,margin:"0 0 14px",cursor:"pointer"}}><input type="checkbox" checked={!!f._closer} onChange={e=>sf(x=>({...x,_closer:e.target.checked}))}/> 🤝 <b>Can close leads</b> <span style={{color:"var(--mu)"}}>(appears in “Transfer to Closer”)</span></label>}
+            {isCarrierForm&&<div style={{marginBottom:14}}>
+              <div className="fl"><label>Carrier company * (this login sees only this carrier's loads)</label>
+                <select value={f.carrierName||""} onChange={e=>sf(x=>({...x,carrierName:e.target.value}))}><option value="">— pick a carrier —</option>{(carriers||[]).map(c=><option key={c.id||c.name} value={c.name}>{c.name}</option>)}</select></div>
+              <div className="al ali" style={{marginTop:10,fontSize:11}}>The carrier sees their loads, revenue, miles/RPM, dispatch fee (set in Carriers), rate cons, PODs and their invoices. Never: other carriers, broker contacts, dispatcher commissions, SSN/EIN or passwords.</div>
+            </div>}
             {isSdrForm&&<>
               <div style={{fontSize:10,fontWeight:700,color:"var(--mu)",letterSpacing:".5px",textTransform:"uppercase",marginBottom:8}}>Referred Trucks (SDR can see only these)</div>
               <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>{allDrvs.map(n=>{const sel=!!sdrT.find(t=>t.driver===n);return(<div key={n} onClick={()=>togSdr(n)} style={{background:sel?"rgba(245,158,11,.15)":"var(--sf)",border:"1px solid "+(sel?"var(--amb)":"var(--b)"),borderRadius:5,padding:"5px 10px",cursor:"pointer",fontSize:12,userSelect:"none",fontWeight:sel?700:400,color:sel?"var(--amb)":"var(--tx)"}}>{sel?"✓ ":""}{n}</div>);})}</div>
@@ -2876,7 +2888,7 @@ function Users({ctx}){
                 </tr>)}</tbody></table></div>}
               <div className="al ali" style={{marginBottom:14,fontSize:11}}>Commission window = {SDR_MONTHS} months from each truck's first completed load (or the start date you set). The SDR only sees these trucks' loads, revenue and commission — no brokers, carriers, other users or company data.</div>
             </>}
-            {!isSdrForm&&<>
+            {!isSdrForm&&!isCarrierForm&&<>
             <div style={{fontSize:10,fontWeight:700,color:"var(--mu)",letterSpacing:".5px",textTransform:"uppercase",marginBottom:8}}>Permanent Drivers</div>
             <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:14}}>{allDrvs.map(n=>{const sel=(f.permDrv||[]).includes(n);return(<div key={n} onClick={()=>togD("permDrv",n)} style={{display:"flex",alignItems:"center",gap:6,background:sel?"rgba(34,197,94,.15)":"var(--sf)",border:"1px solid "+(sel?"#22c55e":"var(--b)"),borderRadius:5,padding:"5px 10px",cursor:"pointer",fontSize:12,userSelect:"none",transition:"all .1s"}}>
               <div style={{width:14,height:14,borderRadius:3,border:"2px solid "+(sel?"#22c55e":"var(--b)"),background:sel?"#22c55e":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
@@ -2921,6 +2933,7 @@ function Carriers({ctx}){
           <div className="fl"><label>Company Name *</label><input value={f.name} onChange={e=>sf(x=>({...x,name:e.target.value}))}/></div>
           <div className="fl"><label>MC # *</label><input value={f.mc} onChange={e=>sf(x=>({...x,mc:e.target.value}))}/></div>
           <div className="fl"><label>DOT #</label><input value={f.dot} onChange={e=>sf(x=>({...x,dot:e.target.value}))}/></div>
+          <div className="fl"><label>Dispatch fee % (carrier pays Vessel)</label><input type="number" step="0.1" placeholder="3" value={f.feePct??""} onChange={e=>sf(x=>({...x,feePct:e.target.value}))}/></div>
           <div className="fl"><label>RMIS ID</label><input value={f.rmis} onChange={e=>sf(x=>({...x,rmis:e.target.value}))}/></div>
           <div className="fl"><label>EIN (W9)</label><input value={f.ein} onChange={e=>sf(x=>({...x,ein:e.target.value}))}/></div>
           <div className="fl"><label>SSN (Owner)</label><input value={f.ssn} onChange={e=>sf(x=>({...x,ssn:e.target.value}))} placeholder="e.g. XXX-XX-XXXX"/></div>
@@ -3866,6 +3879,273 @@ function SDRPerformance({users,loads,drivers}){
         </tr>)}</tbody></table></div>}
     </div>
   </>);
+}
+
+// CARRIER PORTAL — external carrier company. Data comes from the carrier_portal() database function,
+// which returns ONLY this carrier's loads/drivers/invoices (no other carriers, broker contacts, commissions or private info).
+function CarrierPortal({onLogout}){
+  const[data,setData]=useState(null);const[err,setErr]=useState("");
+  const[tab,setTab]=useState("overview");// overview | loads | invoices
+  const now=new Date();
+  const ym=d=>d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0");
+  const[period,setPeriod]=useState("month");const[month,setMonth]=useState(ym(now));const[year,setYear]=useState(String(now.getFullYear()));
+  const[drv,setDrv]=useState("All");const[q,setQ]=useState("");
+  // phone layout: cards instead of wide tables (carriers mostly check this on their phone)
+  const[mob,setMob]=useState(()=>window.innerWidth<700);
+  React.useEffect(()=>{const f=()=>setMob(window.innerWidth<700);window.addEventListener("resize",f);return()=>window.removeEventListener("resize",f);},[]);
+  React.useEffect(()=>{
+    let on=true;
+    const go=()=>fetch(SB+"/rest/v1/rpc/carrier_portal",{method:"POST",headers:SBH,body:"{}"})
+      .then(async r=>{const d=await r.json().catch(()=>({}));if(!on)return;if(r.ok){setData(d);setErr("");}else setErr(d.message||"Could not load your data");})
+      .catch(()=>on&&setErr("Offline — retrying…"));
+    go();const iv=setInterval(go,60000);return()=>{on=false;clearInterval(iv);};
+  },[]);
+  const fmt=n=>"$"+(n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  const fmt0=n=>"$"+Math.round(n||0).toLocaleString();
+  const mLabel=k=>{const[y,m]=k.split("-");return new Date(y,m-1,1).toLocaleString("en-US",{month:"short",year:"numeric"});};
+  const loadDt=l=>{const d=new Date((l.dlv||l.pu||l.date||l.ts||"").slice(0,10)+"T12:00");return isNaN(d)?null:d;};
+  const tabs=<div style={{display:"flex",gap:6,padding:"10px 12px",background:"var(--sf)",borderBottom:"1px solid var(--b)",flexWrap:"wrap",alignItems:"center",position:"sticky",top:0,zIndex:20}}>
+    {[["overview","📊 Overview"],["insights","📈 Insights"],["loads","🚛 Loads"],["invoices","🧾 Invoices"]].map(([id,l])=><button key={id} className={"btn btn-sm "+(tab===id?"btn-p":"btn-s")} onClick={()=>setTab(id)}>{l}</button>)}
+    <button className="btn btn-s btn-sm" style={{marginLeft:"auto"}} onClick={onLogout}>Sign Out</button>
+  </div>;
+  if(!data)return<div style={{minHeight:"100vh",background:"var(--bg)"}}>{tabs}<div style={{padding:40,textAlign:"center",color:"var(--mu)"}}>{err||"Loading…"}</div></div>;
+
+  const c=data.carrier||{};const fee=Number(c.feePct)||0;
+  const all=(data.loads||[]).map(l=>({...l,amount:Number(l.amount)||0,tm:totMiles(l),st:getAutoStatus(l)})).sort((a,b)=>(loadDt(b)||0)-(loadDt(a)||0));
+  const live=all.filter(l=>!l.cancelled&&l.st!=="Cancelled");
+  const inPeriod=l=>{const d=loadDt(l);if(!d)return period==="all";const k=ym(d);return period==="all"||(period==="year"?k.startsWith(year+"-"):k===month);};
+  const pl=live.filter(inPeriod);
+  const sum=(a,f)=>a.reduce((s,x)=>s+f(x),0);
+  const rev=sum(pl,l=>l.amount),mi=sum(pl,l=>l.tm),feeAmt=rev*fee/100;
+  const months=[...new Set([ym(now),...live.map(l=>loadDt(l)).filter(Boolean).map(ym)])].sort().reverse();
+  const years=[...new Set(months.map(k=>k.slice(0,4)))].sort().reverse();
+  const periodLabel=period==="all"?"All Time":period==="year"?year:mLabel(month);
+  const seg=(val,set,opts)=><div style={{display:"flex",gap:5,background:"var(--sf)",border:"1px solid var(--b)",borderRadius:8,padding:3}}>
+    {opts.map(([v,l])=><button key={v} onClick={()=>set(v)} style={{padding:"5px 12px",borderRadius:6,border:"none",fontSize:12,fontWeight:600,cursor:"pointer",background:val===v?"var(--card)":"transparent",color:val===v?"var(--tx)":"var(--mu)",fontFamily:"inherit"}}>{l}</button>)}</div>;
+  const periodBar=<div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+    {seg(period,setPeriod,[["month","Month"],["year","Year"],["all","All Time"]])}
+    {period==="month"&&<select value={month} onChange={e=>setMonth(e.target.value)}>{months.map(k=><option key={k} value={k}>{mLabel(k)}</option>)}</select>}
+    {period==="year"&&<select value={year} onChange={e=>setYear(e.target.value)}>{years.map(y=><option key={y}>{y}</option>)}</select>}
+  </div>;
+  const header=sub=><div className="tb"><div><div className="pt">🏢 {c.name} — Carrier Portal</div><div className="ps">{[c.mc&&"MC "+c.mc,c.dot&&"DOT "+c.dot,"Dispatch fee "+fee+"%",sub].filter(Boolean).join(" · ")}</div></div>{tab!=="invoices"&&periodBar}</div>;
+  const kv=(l,v,c)=><div><div style={{fontSize:9,color:"var(--mu)",textTransform:"uppercase",letterSpacing:".4px"}}>{l}</div><div style={{fontWeight:700,fontSize:13,color:c||"var(--tx)"}}>{v}</div></div>;
+  const cgrid=ch=><div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"8px 10px",marginTop:10}}>{ch}</div>;
+  const stBadge=s=><span className={"bdg "+(s==="Delivered"?"bg":s==="Cancelled"?"br":s==="In Transit"?"bb":"bx")}>{s}</span>;
+  const docs=l=>{const pods=(l.pods&&l.pods.length?l.pods:(l.pod?[l.pod]:[]));return<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+    {l.rateCon?<a className="bdg bb" href={l.rateCon} target="_blank" rel="noopener">Rate Con</a>:<span className="bdg bx">no RC</span>}
+    {pods.map((p,i)=><a key={i} className="bdg bg" href={p} target="_blank" rel="noopener">POD{pods.length>1?" "+(i+1):""}</a>)}</div>;};
+
+  // ── Overview
+  if(tab==="overview"){
+    const byDrv={};pl.forEach(l=>{const k=l.driver||"—";(byDrv[k]=byDrv[k]||{n:0,rev:0,mi:0});byDrv[k].n++;byDrv[k].rev+=l.amount;byDrv[k].mi+=l.tm;});
+    const truckOf=n=>(data.drivers||[]).find(d=>(d.name||"").toUpperCase()===(n||"").toUpperCase())||{};
+    return<div style={{minHeight:"100vh",background:"var(--bg)"}}>{tabs}{header()}
+      <div className="con">
+        <div style={{fontSize:11,color:"var(--mu)",fontWeight:600,textTransform:"uppercase",letterSpacing:".5px",marginBottom:12}}>{periodLabel}</div>
+        <div className="mg">
+          <div className="mc"><div className="ml">Loads</div><div className="mv cb">{pl.length}</div></div>
+          <div className="mc"><div className="ml">Gross Revenue</div><div className="mv cacc">{fmt0(rev)}</div></div>
+          <div className="mc"><div className="ml">Miles (incl. DH)</div><div className="mv">{Math.round(mi).toLocaleString()}</div></div>
+          <div className="mc"><div className="ml">Avg RPM (incl. DH)</div><div className="mv">{mi?"$"+(rev/mi).toFixed(2):"—"}</div></div>
+          <div className="mc"><div className="ml">Dispatch Fee ({fee}%)</div><div className="mv ca">{fmt(feeAmt)}</div></div>
+          <div className="mc"><div className="ml">Net to You</div><div className="mv cg">{fmt(rev-feeAmt)}</div></div>
+        </div>
+        <div className="sh"><div className="st">By Driver / Truck</div></div>
+        {Object.keys(byDrv).length===0?<div style={{padding:30,textAlign:"center",color:"var(--mu)"}}>No loads in this period</div>:
+        (mob?<div>{Object.entries(byDrv).sort((a,b)=>b[1].rev-a[1].rev).map(([n,v])=><div key={n} className="card" style={{padding:12,marginBottom:10}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline"}}><b style={{fontSize:14}}>{n}{truckOf(n).truck?<span style={{color:"var(--mu)",fontWeight:400,fontSize:11}}> · Truck {truckOf(n).truck}</span>:null}</b><span style={{color:"var(--acc)",fontWeight:800}}>{fmt0(v.rev)}</span></div>
+          {cgrid(<>{kv("Loads",v.n)}{kv("Miles",Math.round(v.mi).toLocaleString())}{kv("RPM",v.mi?"$"+(v.rev/v.mi).toFixed(2):"—")}{kv("Fee",fmt(v.rev*fee/100))}{kv("Net",fmt(v.rev*(1-fee/100)),"var(--green)")}</>)}
+        </div>)}</div>:<div className="tw"><table><thead><tr><th>Driver</th><th>Truck</th><th>Loads</th><th>Miles (incl. DH)</th><th>Revenue</th><th>RPM</th><th>Dispatch Fee</th><th>Net</th></tr></thead>
+          <tbody>{Object.entries(byDrv).sort((a,b)=>b[1].rev-a[1].rev).map(([n,v])=><tr key={n}>
+            <td style={{fontWeight:700}}>{n}</td><td>{truckOf(n).truck||"—"}</td><td><span className="bdg bx">{v.n}</span></td>
+            <td>{Math.round(v.mi).toLocaleString()}</td><td style={{color:"var(--acc)"}}>{fmt0(v.rev)}</td>
+            <td>{v.mi?"$"+(v.rev/v.mi).toFixed(2):"—"}</td><td>{fmt(v.rev*fee/100)}</td><td style={{fontWeight:700,color:"var(--green)"}}>{fmt(v.rev*(1-fee/100))}</td></tr>)}
+          <tr><td style={{fontWeight:800}}>Total</td><td></td><td>{pl.length}</td><td>{Math.round(mi).toLocaleString()}</td><td style={{fontWeight:700}}>{fmt0(rev)}</td><td>{mi?"$"+(rev/mi).toFixed(2):"—"}</td><td>{fmt(feeAmt)}</td><td style={{fontWeight:800,color:"var(--green)"}}>{fmt(rev-feeAmt)}</td></tr>
+          </tbody></table></div>)}
+        <div style={{fontSize:10,color:"var(--mu)",marginTop:10}}>Cancelled loads are not counted. Dispatch fee is an estimate at {fee}% of gross revenue; your invoices show the amounts actually billed.</div>
+      </div></div>;
+  }
+
+  // ── Insights: fleet + driver comparison, days on the road vs days off, top lanes
+  if(tab==="insights"){
+    const dKey=d=>d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
+    const pd=s=>{if(!s)return null;const d=new Date(String(s).slice(0,10)+"T12:00");return isNaN(d)?null:d;};
+    const today=new Date();today.setHours(12,0,0,0);
+    // period range (never past today)
+    let rs,re;
+    if(period==="month"){const[y,m]=month.split("-").map(Number);rs=new Date(y,m-1,1,12);re=new Date(y,m,0,12);}
+    else if(period==="year"){rs=new Date(+year,0,1,12);re=new Date(+year,11,31,12);}
+    else{const f=live.map(l=>pd(l.pu)||loadDt(l)).filter(Boolean).sort((a,b)=>a-b)[0];rs=f||today;re=today;}
+    if(re>today)re=today;
+    const rangeDays=re>=rs?Math.round((re-rs)/864e5)+1:0;
+    // each load occupies the days from pickup to delivery
+    const spanDays=l=>{const a=pd(l.pu)||loadDt(l),b=pd(l.dlv)||a;if(!a)return[];const out=[];for(let d=new Date(a);d<=b&&out.length<30;d.setDate(d.getDate()+1)){if(d>=rs&&d<=re)out.push(dKey(d));}return out;};
+    const drivers={};
+    pl.forEach(l=>{const k=l.driver||"—";const x=drivers[k]=drivers[k]||{n:0,rev:0,mi:0,dh:0,days:new Set(),loads:[]};
+      x.n++;x.rev+=l.amount;x.mi+=l.tm;x.dh+=parseFloat(l.dh)||0;spanDays(l).forEach(d=>x.days.add(d));x.loads.push(l);});
+    const fleetRev=sum(Object.values(drivers),x=>x.rev);
+    const rows=Object.entries(drivers).map(([name,x])=>{
+      const on=x.days.size,off=Math.max(0,rangeDays-on);
+      // longest stretch of consecutive days with no load inside the period
+      let longest=0,run=0;for(let i=0;i<rangeDays;i++){const d=new Date(rs);d.setDate(d.getDate()+i);if(x.days.has(dKey(d)))run=0;else{run++;longest=Math.max(longest,run);}}
+      return{name,n:x.n,rev:x.rev,mi:x.mi,dh:x.dh,rpm:x.mi?x.rev/x.mi:0,perLoad:x.n?x.rev/x.n:0,on,off,util:rangeDays?on/rangeDays:0,perDay:on?x.rev/on:0,longest,share:fleetRev?x.rev/fleetRev:0,dhPct:x.mi?x.dh/x.mi:0};
+    }).sort((a,b)=>b.rev-a.rev);
+    const best=k=>rows.length>1?Math.max(...rows.map(r=>r[k])):null;
+    const bestLow=k=>rows.length>1?Math.min(...rows.map(r=>r[k])):null;
+    const trophy=(r,k,low)=>rows.length>1&&r[k]===(low?bestLow(k):best(k))&&r[k]>0?" 🏆":"";
+    const bar=(v,max,color)=><div style={{height:5,background:"var(--b)",borderRadius:3,marginTop:3,overflow:"hidden"}}><div style={{height:"100%",width:(max?Math.min(100,v/max*100):0)+"%",background:color,borderRadius:3}}/></div>;
+    const maxRev=Math.max(1,...rows.map(r=>r.rev)),maxRpm=Math.max(1,...rows.map(r=>r.rpm));
+    const avgUtil=rows.length?sum(rows,r=>r.util)/rows.length:0;
+    // lanes by state (e.g. "TX → CA")
+    const st=s=>{const m=String(s||"").match(/,\s*([A-Z]{2})\b/)||String(s||"").match(/\b([A-Z]{2})\s*\d{5}/)||String(s||"").match(/\b([A-Z]{2})\s*$/);return m?m[1]:(String(s||"").split(",")[0]||"?").trim();};
+    const lanes={};pl.forEach(l=>{const k=st(l.pickup)+" → "+st(l.delivery);const x=lanes[k]=lanes[k]||{n:0,rev:0,mi:0};x.n++;x.rev+=l.amount;x.mi+=l.tm;});
+    const topLanes=Object.entries(lanes).sort((a,b)=>b[1].n-a[1].n||b[1].rev-a[1].rev).slice(0,8);
+    // brokers (name only)
+    const brk={};pl.forEach(l=>{const k=(l.broker||"—").trim()||"—";const x=brk[k.toUpperCase()]=brk[k.toUpperCase()]||{name:k,n:0,rev:0,mi:0};x.n++;x.rev+=l.amount;x.mi+=l.tm;});
+    const brokers=Object.values(brk).sort((a,b)=>b.rev-a.rev);
+    // weekly revenue (Mon–Sun), last 12 weeks of the period
+    const wk={};pl.forEach(l=>{const d=loadDt(l);if(!d)return;const m=new Date(d);m.setDate(m.getDate()-((m.getDay()+6)%7));const k=dKey(m);wk[k]=(wk[k]||0)+l.amount;});
+    const weeks=Object.entries(wk).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);const maxWk=Math.max(1,...weeks.map(w=>w[1]));
+    // speed: days per load, miles per day on the road
+    const totOn=sum(rows,r=>r.on),daysPerLoad=pl.length?sum(pl,l=>{const a=pd(l.pu)||loadDt(l),b=pd(l.dlv)||a;return a?Math.max(1,Math.round((b-a)/864e5)+1):1;})/pl.length:0;
+    // previous period for comparison
+    let prevRev=null,prevLabel="";
+    if(period==="month"){const[y,m]=month.split("-").map(Number);const pk=ym(new Date(y,m-2,1));prevRev=sum(live.filter(l=>{const d=loadDt(l);return d&&ym(d)===pk;}),l=>l.amount);prevLabel=mLabel(pk);}
+    if(period==="year"){const py=String(+year-1);prevRev=sum(live.filter(l=>{const d=loadDt(l);return d&&String(d.getFullYear())===py;}),l=>l.amount);prevLabel=py;}
+    const fleetMi=sum(rows,r=>r.mi),fleetDh=sum(rows,r=>r.dh);
+    const noPod=pl.filter(l=>l.st==="Delivered"&&!(l.pods&&l.pods.length)&&!l.pod);
+    const openInv=(data.invoices||[]).filter(i=>!i.paid);
+    const tips=[];
+    if(prevRev!==null&&prevRev>0){const ch=(fleetRev-prevRev)/prevRev;tips.push([ch>=0?"📈":"📉","Revenue is "+(ch>=0?"up ":"down ")+Math.abs(Math.round(ch*100))+"% vs "+prevLabel+" ("+fmt0(fleetRev)+" vs "+fmt0(prevRev)+")."]);}
+    if(rows.length){const t=rows[0];tips.push(["🥇",t.name+" earned the most: "+fmt0(t.rev)+" ("+Math.round(t.share*100)+"% of the fleet) over "+t.n+" load"+(t.n>1?"s":"")+"."]);}
+    const rr=rows.filter(r=>r.rpm>0);if(rr.length>1){const hi=rr.reduce((a,b)=>b.rpm>a.rpm?b:a),lo=rr.reduce((a,b)=>b.rpm<a.rpm?b:a);if(hi!==lo&&hi.rpm-lo.rpm>=0.05)tips.push(["💲",hi.name+" has the best RPM ($"+hi.rpm.toFixed(2)+"); "+lo.name+" the lowest ($"+lo.rpm.toFixed(2)+") — a $"+(hi.rpm-lo.rpm).toFixed(2)+"/mile gap."]);}
+    if(rows.length){const o=rows.reduce((a,b)=>b.off>a.off?b:a);if(o.off>0)tips.push(["🛑",o.name+" had the most days off: "+o.off+" of "+rangeDays+" (longest break "+o.longest+" day"+(o.longest===1?"":"s")+")."]);}
+    if(fleetMi>0){const dhp=fleetDh/fleetMi;const w=rows.filter(r=>r.mi>0).reduce((a,b)=>b.dhPct>a.dhPct?b:a,{dhPct:0});tips.push(["🛣️","Deadhead is "+Math.round(dhp*100)+"% of all miles"+(w.name&&w.dhPct>dhp+0.05?"; highest for "+w.name+" ("+Math.round(w.dhPct*100)+"%)":"")+"."]);}
+    if(brokers.length>1&&fleetRev>0){const b=brokers[0],sh=b.rev/fleetRev;tips.push([sh>0.5?"⚠️":"🤝",b.name+" is your top broker: "+Math.round(sh*100)+"% of revenue"+(sh>0.5?" — a lot of eggs in one basket.":".")]);}
+    if(totOn>0)tips.push(["⏱️","Loads take "+daysPerLoad.toFixed(1)+" days on average; trucks covered "+Math.round(fleetMi/totOn).toLocaleString()+" miles per working day."]);
+    if(noPod.length)tips.push(["📄",noPod.length+" delivered load"+(noPod.length>1?"s are":" is")+" missing a POD."]);
+    if(openInv.length)tips.push(["🧾",openInv.length+" dispatch-fee invoice"+(openInv.length>1?"s are":" is")+" open: "+fmt(sum(openInv,i=>Number(i.amount)||0))+"."]);
+    return<div style={{minHeight:"100vh",background:"var(--bg)"}}>{tabs}{header()}
+      <div className="con">
+        <div style={{fontSize:11,color:"var(--mu)",fontWeight:600,textTransform:"uppercase",letterSpacing:".5px",marginBottom:12}}>{periodLabel} · {rangeDays} days{period!=="all"&&re<(period==="month"?new Date(+month.slice(0,4),+month.slice(5,7),0):new Date(+year,11,31))?" so far":""}</div>
+        <div className="mg">
+          <div className="mc"><div className="ml">Active Drivers</div><div className="mv cb">{rows.length}</div></div>
+          <div className="mc"><div className="ml">Loads</div><div className="mv">{pl.length}</div></div>
+          <div className="mc"><div className="ml">Revenue</div><div className="mv cacc">{fmt0(fleetRev)}</div></div>
+          <div className="mc"><div className="ml">Avg per Driver</div><div className="mv">{fmt0(rows.length?fleetRev/rows.length:0)}</div></div>
+          <div className="mc"><div className="ml">Avg Utilization</div><div className="mv cg">{Math.round(avgUtil*100)}%</div></div>
+          <div className="mc"><div className="ml">Total Days Off</div><div className="mv ca">{sum(rows,r=>r.off)}</div></div>
+        </div>
+        {tips.length>0&&<div className="card" style={{padding:14,marginBottom:14,border:"1px solid rgba(99,102,241,.3)",background:"rgba(99,102,241,.06)"}}>
+          <div style={{fontWeight:700,fontSize:13,marginBottom:8,color:"#818cf8"}}>💡 Key takeaways — {periodLabel}</div>
+          {tips.map(([i,t],n)=><div key={n} style={{fontSize:12,lineHeight:1.7,display:"flex",gap:8}}><span>{i}</span><span>{t}</span></div>)}
+        </div>}
+        {rows.length===0?<div style={{padding:30,textAlign:"center",color:"var(--mu)"}}>No loads in this period</div>:<>
+        <div className="sh"><div className="st">Driver Comparison</div></div>
+        {mob?<div>{rows.map(r=><div key={r.name} className="card" style={{padding:12,marginBottom:10}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline"}}><b style={{fontSize:14}}>{r.name}</b><span style={{color:"var(--acc)",fontWeight:800}}>{fmt0(r.rev)}{trophy(r,"rev")}</span></div>
+          <div style={{fontSize:11,color:"var(--mu)"}}>{Math.round(r.share*100)}% of fleet revenue · {r.n} load{r.n>1?"s":""}</div>
+          {bar(r.rev,maxRev,"var(--acc)")}
+          {cgrid(<>{kv("RPM",r.rpm?"$"+r.rpm.toFixed(2)+trophy(r,"rpm"):"—")}{kv("Avg / load",fmt0(r.perLoad))}{kv("Miles",Math.round(r.mi).toLocaleString())}
+            {kv("On road",r.on+" days"+trophy(r,"on"),"var(--green)")}{kv("Days off",r.off,"var(--amb)")}{kv("Utilization",Math.round(r.util*100)+"%"+trophy(r,"util"))}
+            {kv("$ / work day",fmt0(r.perDay))}{kv("Longest break",r.longest+"d")}{kv("Deadhead",Math.round(r.dhPct*100)+"%")}</>)}
+        </div>)}</div>:
+        <div className="tw"><table><thead><tr><th>Driver</th><th>Loads</th><th>Revenue</th><th>Share</th><th>Miles (incl. DH)</th><th>DH %</th><th>RPM</th><th>Avg / Load</th><th>Days on Road</th><th>Days Off</th><th>Utilization</th><th>Revenue / Working Day</th><th>Longest Break</th></tr></thead>
+          <tbody>{rows.map(r=><tr key={r.name}>
+            <td style={{fontWeight:700}}>{r.name}</td>
+            <td>{r.n}{trophy(r,"n")}</td>
+            <td style={{color:"var(--acc)",fontWeight:700}}>{fmt0(r.rev)}{trophy(r,"rev")}{bar(r.rev,maxRev,"var(--acc)")}</td>
+            <td>{Math.round(r.share*100)}%</td>
+            <td>{Math.round(r.mi).toLocaleString()}</td>
+            <td>{Math.round(r.dhPct*100)}%{trophy(r,"dhPct",true)}</td>
+            <td>{r.rpm?"$"+r.rpm.toFixed(2):"—"}{trophy(r,"rpm")}{bar(r.rpm,maxRpm,"var(--green)")}</td>
+            <td>{fmt0(r.perLoad)}</td>
+            <td style={{color:"var(--green)",fontWeight:700}}>{r.on}{trophy(r,"on")}</td>
+            <td style={{color:r.off?"var(--amb)":"var(--mu)"}}>{r.off}</td>
+            <td>{Math.round(r.util*100)}%{trophy(r,"util")}{bar(r.util,1,"var(--blue)")}</td>
+            <td>{fmt0(r.perDay)}{trophy(r,"perDay")}</td>
+            <td>{r.longest} day{r.longest===1?"":"s"}</td>
+          </tr>)}</tbody></table></div>
+        }
+        <div className="sh" style={{marginTop:14}}><div className="st">Days on the Road vs Days Off</div></div>
+        <div className="card" style={{padding:14}}>
+          {rows.map(r=><div key={r.name} style={{marginBottom:10}}>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:4}}><b>{r.name}</b><span style={{color:"var(--mu)"}}><span style={{color:"var(--green)"}}>{r.on} on the road</span> · <span style={{color:"var(--amb)"}}>{r.off} off</span> · {Math.round(r.util*100)}%</span></div>
+            <div style={{display:"flex",height:12,borderRadius:6,overflow:"hidden",background:"var(--b)"}}>
+              <div style={{width:(rangeDays?r.on/rangeDays*100:0)+"%",background:"var(--green)"}}/>
+              <div style={{width:(rangeDays?r.off/rangeDays*100:0)+"%",background:"rgba(245,158,11,.55)"}}/>
+            </div>
+          </div>)}
+          <div style={{fontSize:10,color:"var(--mu)"}}>A day "on the road" is any day between a load's pickup and delivery date. Days off = days in the period with no load.</div>
+        </div>
+        {weeks.length>1&&<><div className="sh" style={{marginTop:14}}><div className="st">Weekly Revenue</div></div>
+        <div className="card" style={{padding:14}}><div style={{display:"flex",alignItems:"flex-end",gap:6,height:140}}>
+          {weeks.map(([k,v])=><div key={k} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"flex-end",height:"100%"}} title={"Week of "+k+": "+fmt0(v)}>
+            <div style={{fontSize:9,color:"var(--mu)",marginBottom:3}}>{v>=1000?"$"+Math.round(v/1000)+"k":fmt0(v)}</div>
+            <div style={{width:"100%",maxWidth:42,height:Math.max(3,v/maxWk*100)+"px",background:"var(--acc)",borderRadius:"4px 4px 0 0"}}/>
+            <div style={{fontSize:9,color:"var(--mu)",marginTop:4}}>{new Date(k+"T12:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})}</div></div>)}
+        </div></div></>}
+        <div className="sh" style={{marginTop:14}}><div className="st">Top Lanes</div></div>
+        <div className="tw"><table><thead><tr><th>Lane</th><th>Loads</th><th>Revenue</th><th>Avg RPM (incl. DH)</th></tr></thead>
+          <tbody>{topLanes.map(([k,v])=><tr key={k}><td style={{fontWeight:600}}>{k}</td><td>{v.n}</td><td style={{color:"var(--green)"}}>{fmt0(v.rev)}</td><td>{v.mi?"$"+(v.rev/v.mi).toFixed(2):"—"}</td></tr>)}</tbody></table></div>
+        <div className="sh" style={{marginTop:14}}><div className="st">Brokers</div></div>
+        <div className="tw"><table><thead><tr><th>Broker</th><th>Loads</th><th>Revenue</th><th>Share</th><th>Avg RPM (incl. DH)</th></tr></thead>
+          <tbody>{brokers.slice(0,10).map(b=><tr key={b.name}><td style={{fontWeight:600}}>{b.name}</td><td>{b.n}</td><td style={{color:"var(--green)"}}>{fmt0(b.rev)}</td><td>{fleetRev?Math.round(b.rev/fleetRev*100):0}%</td><td>{b.mi?"$"+(b.rev/b.mi).toFixed(2):"—"}</td></tr>)}</tbody></table></div>
+        </>}
+        <div style={{fontSize:10,color:"var(--mu)",marginTop:10}}>Cancelled loads are not counted. Loads are placed in the period by delivery date.</div>
+      </div></div>;
+  }
+
+  // ── Loads
+  if(tab==="loads"){
+    const drivers=[...new Set(all.map(l=>l.driver).filter(Boolean))].sort();
+    const ql=q.trim().toLowerCase();
+    const rows=all.filter(inPeriod).filter(l=>(drv==="All"||l.driver===drv)&&(!ql||[l.loadNum,l.pickup,l.delivery,l.broker,l.driver].some(v=>(v||"").toLowerCase().includes(ql))));
+    return<div style={{minHeight:"100vh",background:"var(--bg)"}}>{tabs}{header()}
+      <div className="con">
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:12,alignItems:"center"}}>
+          <input className="si" placeholder="Search load #, city, broker…" value={q} onChange={e=>setQ(e.target.value)} style={{minWidth:220}}/>
+          <select value={drv} onChange={e=>setDrv(e.target.value)}><option value="All">All drivers</option>{drivers.map(d=><option key={d}>{d}</option>)}</select>
+          <span style={{fontSize:11,color:"var(--mu)"}}>{periodLabel} · {rows.length} loads</span>
+        </div>
+        {rows.length===0?<div style={{padding:30,textAlign:"center",color:"var(--mu)"}}>No loads found</div>:
+        (mob?<div>{rows.map(l=>{const can=l.cancelled||l.st==="Cancelled";return<div key={l.id} className="card" style={{padding:12,marginBottom:10,opacity:can?.55:1}}>
+          <div style={{display:"flex",justifyContent:"space-between",gap:8,alignItems:"center"}}><span style={{fontFamily:"monospace",fontSize:12,fontWeight:700}}>#{l.loadNum}</span>{stBadge(can?"Cancelled":l.st)}</div>
+          <div style={{fontWeight:700,fontSize:13,marginTop:6}}>{(l.pickup||"").split(",").slice(0,2).join(",")} → {(l.delivery||"").split(",").slice(0,2).join(",")}</div>
+          <div style={{fontSize:11,color:"var(--mu)",marginTop:2}}>{l.dlv||l.pu||"—"} · {l.driver}{l.broker?" · "+l.broker:""}</div>
+          {cgrid(<>{kv("Revenue",fmt0(l.amount),"var(--green)")}{kv("Miles",l.tm?l.tm.toLocaleString():"—")}{kv("RPM",l.tm&&l.amount?"$"+(l.amount/l.tm).toFixed(2):"—")}</>)}
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:10,gap:8,flexWrap:"wrap"}}>{docs(l)}<span style={{fontSize:11,color:"var(--mu)"}}>Fee {can?"—":fmt(l.amount*fee/100)}</span></div>
+        </div>;})}</div>:<div className="tw"><table><thead><tr><th>Delivery</th><th>Load #</th><th>Driver</th><th>Route</th><th>Broker</th><th>Miles (incl. DH)</th><th>Revenue</th><th>RPM</th><th>Fee</th><th>Status</th><th>Documents</th></tr></thead>
+          <tbody>{rows.map(l=>{const can=l.cancelled||l.st==="Cancelled";return<tr key={l.id} style={can?{opacity:.5}:null}>
+            <td style={{fontSize:11}}>{l.dlv||l.pu||"—"}</td><td style={{fontFamily:"monospace",fontSize:11}}>{l.loadNum}</td><td style={{fontWeight:600}}>{l.driver}</td>
+            <td style={{fontSize:11}}>{(l.pickup||"").split(",").slice(0,2).join(",")} → {(l.delivery||"").split(",").slice(0,2).join(",")}</td>
+            <td style={{fontSize:11}}>{l.broker||"—"}</td>
+            <td style={{fontSize:11}}>{l.tm?l.tm.toLocaleString():"—"}{parseFloat(l.dh)>0&&<div style={{fontSize:9,opacity:.75}}>{(parseFloat(l.miles)||0).toLocaleString()} + {parseFloat(l.dh).toLocaleString()} DH</div>}</td>
+            <td style={{color:"var(--green)",fontWeight:700,textDecoration:can?"line-through":"none"}}>{fmt0(l.amount)}</td>
+            <td style={{fontSize:11}}>{l.tm&&l.amount?"$"+(l.amount/l.tm).toFixed(2):"—"}</td>
+            <td style={{fontSize:11}}>{can?"—":fmt(l.amount*fee/100)}</td>
+            <td>{stBadge(can?"Cancelled":l.st)}</td><td>{docs(l)}</td></tr>;})}</tbody></table></div>)}
+      </div></div>;
+  }
+
+  // ── Invoices
+  const inv=(data.invoices||[]);
+  const unpaid=inv.filter(i=>!i.paid);
+  return<div style={{minHeight:"100vh",background:"var(--bg)"}}>{tabs}{header()}
+    <div className="con">
+      <div className="mg">
+        <div className="mc"><div className="ml">Invoices</div><div className="mv cb">{inv.length}</div></div>
+        <div className="mc"><div className="ml">Paid</div><div className="mv cg">{fmt(sum(inv.filter(i=>i.paid),i=>Number(i.amount)||0))}</div></div>
+        <div className="mc"><div className="ml">Open (unpaid)</div><div className="mv ca">{fmt(sum(unpaid,i=>Number(i.amount)||0))}</div></div>
+      </div>
+      {inv.length===0?<div style={{padding:30,textAlign:"center",color:"var(--mu)"}}>No invoices yet</div>:
+      <div className="tw"><table><thead><tr><th>Invoice #</th><th>Date</th><th>Loads</th><th>Load Total</th><th>Fee %</th><th>Dispatch Fee</th><th>Status</th></tr></thead>
+        <tbody>{inv.map(i=><tr key={i.num}>
+          <td style={{fontFamily:"monospace",fontWeight:700}}>{i.num}{i.shared&&<div style={{fontSize:9,color:"var(--mu)",fontFamily:"inherit"}}>your share of a combined invoice</div>}</td>
+          <td>{i.date}</td><td>{i.loads}</td><td>{fmt(Number(i.loadTotal)||0)}</td><td>{i.pct}%</td>
+          <td style={{fontWeight:700}}>{fmt(Number(i.amount)||0)}</td>
+          <td><span className={"bdg "+(i.paid?"bg":"ba")}>{i.paid?"Paid":"Open"}</span></td></tr>)}</tbody></table></div>}
+    </div></div>;
 }
 
 // SDR PORTAL — external sales rep. Data comes from the sdr_portal() database function,
